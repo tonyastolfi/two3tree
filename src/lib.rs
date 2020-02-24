@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
 #![allow(unused_mut)]
+#![allow(unused_imports)]
 
 #[derive(Clone, Debug)]
 enum Node {
@@ -31,22 +32,25 @@ enum Insert {
     Ok,
 }
 
+use Insert::Split;
+use Node::{Inner2, Inner3, Leaf2, Leaf3, Nil};
+
 impl Node {
     fn insert(&mut self, new_val: i32) -> Insert {
         match self {
-            Node::Nil => {
-                *self = Node::Leaf2 { val: new_val };
+            Nil => {
+                *self = Leaf2 { val: new_val };
                 Insert::Ok
             }
 
-            Node::Leaf2 { val } => {
+            Leaf2 { val } => {
                 if new_val < *val {
-                    *self = Node::Leaf3 {
+                    *self = Leaf3 {
                         val1: new_val,
                         val2: *val,
                     }
                 } else {
-                    *self = Node::Leaf3 {
+                    *self = Leaf3 {
                         val1: *val,
                         val2: new_val,
                     }
@@ -54,55 +58,58 @@ impl Node {
                 Insert::Ok
             }
 
-            Node::Leaf3 { val1, val2 } => {
+            Leaf3 { val1, val2 } => {
                 if new_val < *val1 {
-                    let result = Insert::Split(*val1, Box::new(Node::Leaf2 { val: *val2 }));
-                    *self = Node::Leaf2 { val: new_val };
+                    let result = Split(*val1, Box::new(Leaf2 { val: *val2 }));
+                    *self = Leaf2 { val: new_val };
                     return result;
                 } else if new_val < *val2 {
-                    let result = Insert::Split(new_val, Box::new(Node::Leaf2 { val: *val2 }));
-                    *self = Node::Leaf2 { val: *val1 };
+                    let result = Split(new_val, Box::new(Leaf2 { val: *val2 }));
+                    *self = Leaf2 { val: *val1 };
                     return result;
                 } else {
-                    let result = Insert::Split(*val2, Box::new(Node::Leaf2 { val: new_val }));
-                    *self = Node::Leaf2 { val: *val1 };
+                    let result = Split(*val2, Box::new(Leaf2 { val: new_val }));
+                    *self = Leaf2 { val: *val1 };
                     return result;
                 }
             }
 
-            Node::Inner2 { left, val, right } => {
+            Inner2 { left, val, right } => {
                 if new_val < *val {
                     match left.insert(new_val) {
                         Insert::Ok => {}
                         Insert::Split(split_val, second) => {
-                            let tmp = Node::Inner3 {
-                                left: std::mem::replace(left, Box::new(Node::Nil)),
-                                val1: split_val,
-                                middle: second,
-                                val2: *val,
-                                right: std::mem::replace(right, Box::new(Node::Nil)),
-                            };
-                            *self = tmp;
+                            if let Inner2 { left, val, right } = std::mem::replace(self, Nil) {
+                                *self = Inner3 {
+                                    left: left,
+                                    val1: split_val,
+                                    middle: second,
+                                    val2: val,
+                                    right: right,
+                                };
+                            }
                         }
                     }
                 } else {
                     match right.insert(new_val) {
                         Insert::Ok => {}
-                        Insert::Split(split_val, second) => {
-                            *self = Node::Inner3 {
-                                left: (*left).clone(),
-                                val1: *val,
-                                middle: (*right).clone(),
-                                val2: split_val,
-                                right: second,
-                            };
+                        Split(split_val, second) => {
+                            if let Inner2 { left, val, right } = std::mem::replace(self, Nil) {
+                                *self = Inner3 {
+                                    left: left,
+                                    val1: val,
+                                    middle: right,
+                                    val2: split_val,
+                                    right: second,
+                                };
+                            }
                         }
                     }
                 }
                 Insert::Ok
             }
 
-            Node::Inner3 {
+            Inner3 {
                 left,
                 val1,
                 middle,
@@ -112,61 +119,91 @@ impl Node {
                 if new_val < *val1 {
                     match left.insert(new_val) {
                         Insert::Ok => Insert::Ok,
-                        Insert::Split(split_val, second) => {
-                            let result = Insert::Split(
-                                *val1,
-                                Box::new(Node::Inner2 {
-                                    left: std::mem::replace(middle, Box::new(Node::Nil)),
-                                    val: *val2,
-                                    right: std::mem::replace(right, Box::new(Node::Nil)),
-                                }),
-                            );
-                            *self = Node::Inner2 {
-                                left: std::mem::replace(left, Box::new(Node::Nil)),
-                                val: split_val,
-                                right: second,
-                            };
-                            result
+                        Split(split_val, second) => {
+                            if let Inner3 {
+                                left,
+                                val1,
+                                middle,
+                                val2,
+                                right,
+                            } = std::mem::replace(self, Nil)
+                            {
+                                *self = Inner2 {
+                                    left: left,
+                                    val: split_val,
+                                    right: second,
+                                };
+                                Split(
+                                    val1,
+                                    Box::new(Inner2 {
+                                        left: middle,
+                                        val: val2,
+                                        right: right,
+                                    }),
+                                )
+                            } else {
+                                panic!("self should not have changed");
+                            }
                         }
                     }
                 } else if new_val < *val2 {
                     match middle.insert(new_val) {
                         Insert::Ok => Insert::Ok,
-                        Insert::Split(split_val, second) => {
-                            let result = Insert::Split(
-                                split_val,
-                                Box::new(Node::Inner2 {
-                                    left: second,
-                                    val: *val2,
-                                    right: std::mem::replace(right, Box::new(Node::Nil)),
-                                }),
-                            );
-                            *self = Node::Inner2 {
-                                left: std::mem::replace(left, Box::new(Node::Nil)),
-                                val: *val1,
-                                right: std::mem::replace(middle, Box::new(Node::Nil)),
-                            };
-                            result
+                        Split(split_val, second) => {
+                            if let Inner3 {
+                                left,
+                                val1,
+                                middle,
+                                val2,
+                                right,
+                            } = std::mem::replace(self, Nil)
+                            {
+                                *self = Inner2 {
+                                    left: left,
+                                    val: val1,
+                                    right: middle,
+                                };
+                                Split(
+                                    split_val,
+                                    Box::new(Inner2 {
+                                        left: second,
+                                        val: val2,
+                                        right: right,
+                                    }),
+                                )
+                            } else {
+                                panic!("self should not have changed");
+                            }
                         }
                     }
                 } else {
                     match right.insert(new_val) {
                         Insert::Ok => Insert::Ok,
-                        Insert::Split(split_val, second) => {
-                            let result = Insert::Split(
-                                *val2,
-                                Box::new(Node::Inner2 {
-                                    left: std::mem::replace(right, Box::new(Node::Nil)),
-                                    val: split_val,
-                                    right: second,
-                                }),
-                            );
-                            *self = Node::Inner2 {
-                                left: std::mem::replace(left, Box::new(Node::Nil)),
-                                val: *val1,
-                                right: std::mem::replace(middle, Box::new(Node::Nil)),
-                            };
-                            result
+                        Split(split_val, second) => {
+                            if let Inner3 {
+                                left,
+                                val1,
+                                middle,
+                                val2,
+                                right,
+                            } = std::mem::replace(self, Nil)
+                            {
+                                *self = Inner2 {
+                                    left: left,
+                                    val: val1,
+                                    right: middle,
+                                };
+                                Split(
+                                    val2,
+                                    Box::new(Inner2 {
+                                        left: right,
+                                        val: split_val,
+                                        right: second,
+                                    }),
+                                )
+                            } else {
+                                panic!("self should not have changed");
+                            }
                         }
                     }
                 }
@@ -176,9 +213,9 @@ impl Node {
 
     fn find<'a>(&'a self, key: i32) -> Option<&'a i32> {
         match self {
-            Node::Nil => None,
+            Nil => None,
 
-            Node::Leaf2 { val } => {
+            Leaf2 { val } => {
                 if key == *val {
                     Some(val)
                 } else {
@@ -186,7 +223,7 @@ impl Node {
                 }
             }
 
-            Node::Leaf3 { val1, val2 } => {
+            Leaf3 { val1, val2 } => {
                 if key == *val1 {
                     Some(val1)
                 } else if key == *val2 {
@@ -196,7 +233,7 @@ impl Node {
                 }
             }
 
-            Node::Inner2 { left, val, right } => {
+            Inner2 { left, val, right } => {
                 if key == *val {
                     Some(val)
                 } else if key < *val {
@@ -206,7 +243,7 @@ impl Node {
                 }
             }
 
-            Node::Inner3 {
+            Inner3 {
                 left,
                 val1,
                 middle,
@@ -232,11 +269,11 @@ impl Node {
 
     fn height(&self) -> usize {
         match self {
-            Node::Nil => 0,
-            Node::Leaf2 { .. } => 1,
-            Node::Leaf3 { .. } => 1,
-            Node::Inner2 { left, .. } => left.height() + 1,
-            Node::Inner3 { left, .. } => left.height() + 1,
+            Nil => 0,
+            Leaf2 { .. } => 1,
+            Leaf3 { .. } => 1,
+            Inner2 { left, .. } => left.height() + 1,
+            Inner3 { left, .. } => left.height() + 1,
         }
     }
 }
@@ -249,15 +286,15 @@ struct Tree {
 impl Tree {
     fn new() -> Self {
         Self {
-            root: Box::new(Node::Nil),
+            root: Box::new(Nil),
         }
     }
     fn insert(&mut self, val: i32) {
         match self.root.insert(val) {
             Insert::Ok => {}
-            Insert::Split(split_val, second) => {
-                let tmp = std::mem::replace(&mut self.root, Box::new(Node::Nil));
-                self.root = Box::new(Node::Inner2 {
+            Split(split_val, second) => {
+                let tmp = std::mem::replace(&mut self.root, Box::new(Nil));
+                self.root = Box::new(Inner2 {
                     left: tmp,
                     val: split_val,
                     right: second,
