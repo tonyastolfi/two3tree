@@ -144,8 +144,8 @@ impl Node {
                         Drained => {
                             *self = Inner2 {
                                 left: middle,
-                                right_min: right_min,
-                                right: right,
+                                right_min,
+                                right,
                             };
                             return Ok;
                         }
@@ -154,8 +154,8 @@ impl Node {
                                 Insert::Ok => {
                                     *self = Inner2 {
                                         left: middle,
-                                        right_min: right_min,
-                                        right: right,
+                                        right_min,
+                                        right,
                                     };
                                 }
                                 Split(split_min, split) => {
@@ -163,8 +163,8 @@ impl Node {
                                         left: middle,
                                         middle_min: split_min,
                                         middle: split,
-                                        right_min: right_min,
-                                        right: right,
+                                        right_min,
+                                        right,
                                     };
                                 }
                             }
@@ -177,9 +177,9 @@ impl Node {
                         NotFound => NotFound,
                         Drained => {
                             *self = Inner2 {
-                                left: left,
-                                right_min: right_min,
-                                right: right,
+                                left,
+                                right_min,
+                                right,
                             };
                             return Ok;
                         }
@@ -187,14 +187,14 @@ impl Node {
                             match right.merge_left(to_merge, right_min) {
                                 Insert::Ok => {
                                     *self = Inner2 {
-                                        left: left,
-                                        right_min: right_min,
-                                        right: right,
+                                        left,
+                                        right_min,
+                                        right,
                                     };
                                 }
                                 Split(split_min, split) => {
                                     *self = Inner3 {
-                                        left: left,
+                                        left,
                                         middle_min: right_min,
                                         middle: right,
                                         right_min: split_min,
@@ -211,7 +211,7 @@ impl Node {
                         NotFound => NotFound,
                         Drained => {
                             *self = Inner2 {
-                                left: left,
+                                left,
                                 right_min: middle_min,
                                 right: middle,
                             };
@@ -221,16 +221,16 @@ impl Node {
                             match middle.merge_right(right_min, to_merge) {
                                 Insert::Ok => {
                                     *self = Inner2 {
-                                        left: left,
+                                        left,
                                         right_min: middle_min,
                                         right: middle,
                                     };
                                 }
                                 Split(split_min, split) => {
                                     *self = Inner3 {
-                                        left: left,
-                                        middle_min: middle_min,
-                                        middle: middle,
+                                        left,
+                                        middle_min,
+                                        middle,
                                         right_min: split_min,
                                         right: split,
                                     };
@@ -266,8 +266,8 @@ impl Node {
                 left: subtree,
                 middle_min: left_min,
                 middle: left,
-                right_min: right_min,
-                right: right,
+                right_min,
+                right,
             };
             return Insert::Ok;
         }
@@ -288,8 +288,8 @@ impl Node {
                 middle_min,
                 Box::new(Inner2 {
                     left: middle,
-                    right_min: right_min,
-                    right: right,
+                    right_min,
+                    right,
                 }),
             );
         }
@@ -305,7 +305,7 @@ impl Node {
         } = node
         {
             *self = Inner3 {
-                left: left,
+                left,
                 middle_min: right_min,
                 middle: right,
                 right_min: subtree_min,
@@ -322,7 +322,7 @@ impl Node {
         } = node
         {
             *self = Inner2 {
-                left: left,
+                left,
                 right_min: middle_min,
                 right: middle,
             };
@@ -386,18 +386,18 @@ impl Node {
                 if new_val < right_min {
                     if let Split(split_min, split) = left.insert(new_val) {
                         *self = Inner3 {
-                            left: left,
+                            left,
                             middle_min: split_min,
                             middle: split,
-                            right_min: right_min,
-                            right: right,
+                            right_min,
+                            right,
                         };
                         return Insert::Ok;
                     }
                 } else {
                     if let Split(split_min, split) = right.insert(new_val) {
                         *self = Inner3 {
-                            left: left,
+                            left,
                             middle_min: right_min,
                             middle: right,
                             right_min: split_min,
