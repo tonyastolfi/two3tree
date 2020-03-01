@@ -3,58 +3,24 @@
 #![allow(unused_mut)]
 #![allow(unused_imports)]
 
-use interval::Interval;
+mod node;
+use crate::node::*;
 
-#[derive(Clone, Debug)]
-enum Node {
-    Inner2 {
-        left: Box<Node>,
-        right_min: i32,
-        right: Box<Node>,
-    },
-    Inner3 {
-        left: Box<Node>,
-        middle_min: i32,
-        middle: Box<Node>,
-        right_min: i32,
-        right: Box<Node>,
-    },
-    Leaf2 {
-        val: i32,
-    },
-    Leaf3 {
-        val1: i32,
-        val2: i32,
-    },
-    Nil,
-}
+mod insert;
+use crate::insert::{insert_inner2, insert_inner3, insert_leaf3, InsertResult};
 
-enum Insert {
-    Ok,
-    Split(i32, Box<Node>),
-}
+mod remove;
+use crate::remove::RemoveResult;
 
-enum Remove {
-    NotFound,
-    Ok,
-    Drained,
-    Orphaned(Box<Node>),
-}
-
-enum SubtreeBound {
-    Lower(i32),
-    Upper(i32),
-}
-
-use Insert::Split;
 use Node::{Inner2, Inner3, Leaf2, Leaf3, Nil};
 
 impl Node {
-    fn insert(&mut self, new_val: i32) -> Insert {
+    fn insert(&mut self, new_val: i32) -> InsertResult {
+        use InsertResult::{Ok, Split};
         match std::mem::replace(self, Nil) {
             Nil => {
                 *self = Leaf2 { val: new_val };
-                Insert::Ok
+                Ok
             }
 
             Leaf2 { val } => {
@@ -62,32 +28,13 @@ impl Node {
                     val1: std::cmp::min(new_val, val),
                     val2: std::cmp::max(new_val, val),
                 };
-                Insert::Ok
+                Ok
             }
 
             Leaf3 { val1, val2 } => {
-                if new_val < val1 {
-                    *self = Leaf2 { val: new_val };
-                    Split(val1, Box::new(Leaf3 { val1, val2 }))
-                } else if new_val < val2 {
-                    *self = Leaf2 { val: val1 };
-                    Split(
-                        new_val,
-                        Box::new(Leaf3 {
-                            val1: new_val,
-                            val2,
-                        }),
-                    )
-                } else {
-                    *self = Leaf2 { val: val1 };
-                    Split(
-                        val2,
-                        Box::new(Leaf3 {
-                            val1: val2,
-                            val2: new_val,
-                        }),
-                    )
-                }
+                let (node, result) = insert_leaf3(new_val, (val1, val2));
+                *self = node;
+                return result;
             }
 
             Inner2 {
@@ -95,35 +42,9 @@ impl Node {
                 right_min,
                 mut right,
             } => {
-                if new_val < right_min {
-                    if let Split(split_min, split) = left.insert(new_val) {
-                        *self = Inner3 {
-                            left,
-                            middle_min: split_min,
-                            middle: split,
-                            right_min,
-                            right,
-                        };
-                        return Insert::Ok;
-                    }
-                } else {
-                    if let Split(split_min, split) = right.insert(new_val) {
-                        *self = Inner3 {
-                            left,
-                            middle_min: right_min,
-                            middle: right,
-                            right_min: split_min,
-                            right: split,
-                        };
-                        return Insert::Ok;
-                    }
-                }
-                *self = Inner2 {
-                    left,
-                    right_min,
-                    right,
-                };
-                Insert::Ok
+                let (node, result) = insert_inner2(new_val, left, right_min, right);
+                *self = node;
+                return result;
             }
 
             Inner3 {
@@ -133,69 +54,16 @@ impl Node {
                 right_min,
                 mut right,
             } => {
-                if new_val < middle_min {
-                    if let Split(split_min, split) = left.insert(new_val) {
-                        *self = Inner2 {
-                            left,
-                            right_min: split_min,
-                            right: split,
-                        };
-                        return Split(
-                            middle_min,
-                            Box::new(Inner2 {
-                                left: middle,
-                                right_min,
-                                right,
-                            }),
-                        );
-                    }
-                } else if new_val < right_min {
-                    if let Split(split_min, split) = middle.insert(new_val) {
-                        *self = Inner2 {
-                            left,
-                            right_min: middle_min,
-                            right: middle,
-                        };
-                        return Split(
-                            split_min,
-                            Box::new(Inner2 {
-                                left: split,
-                                right_min,
-                                right,
-                            }),
-                        );
-                    }
-                } else {
-                    if let Split(split_min, split) = right.insert(new_val) {
-                        *self = Inner2 {
-                            left,
-                            right_min: middle_min,
-                            right: middle,
-                        };
-                        return Split(
-                            right_min,
-                            Box::new(Inner2 {
-                                left: right,
-                                right_min: split_min,
-                                right: split,
-                            }),
-                        );
-                    }
-                }
-                *self = Inner3 {
-                    left,
-                    middle_min,
-                    middle,
-                    right_min,
-                    right,
-                };
-                Insert::Ok
+                let (node, result) =
+                    insert_inner3(new_val, left, middle_min, middle, right_min, right);
+                *self = node;
+                return result;
             }
         }
     }
 
-    fn remove(&mut self, rm_val: i32) -> Remove {
-        use Remove::{Drained, NotFound, Ok, Orphaned};
+    fn remove(&mut self, rm_val: i32) -> RemoveResult {
+        use RemoveResult::{Drained, NotFound, Ok, Orphaned};
         match std::mem::replace(self, Nil) {
             Nil => NotFound,
             Leaf2 { val } => {
@@ -232,10 +100,10 @@ impl Node {
                             return Orphaned(right);
                         }
                         Orphaned(to_merge) => match right.merge_left(to_merge, right_min) {
-                            Insert::Ok => {
+                            InsertResult::Ok => {
                                 return Orphaned(right);
                             }
-                            Insert::Split(split_min, split) => {
+                            InsertResult::Split(split_min, split) => {
                                 *self = Inner2 {
                                     left: right,
                                     right_min: split_min,
@@ -253,10 +121,10 @@ impl Node {
                             return Orphaned(left);
                         }
                         Orphaned(to_merge) => match left.merge_right(right_min, to_merge) {
-                            Insert::Ok => {
+                            InsertResult::Ok => {
                                 return Orphaned(left);
                             }
-                            Insert::Split(split_min, split) => {
+                            InsertResult::Split(split_min, split) => {
                                 *self = Inner2 {
                                     left,
                                     right_min: split_min,
@@ -295,14 +163,14 @@ impl Node {
                         }
                         Orphaned(to_merge) => {
                             match middle.merge_left(to_merge, middle_min) {
-                                Insert::Ok => {
+                                InsertResult::Ok => {
                                     *self = Inner2 {
                                         left: middle,
                                         right_min,
                                         right,
                                     };
                                 }
-                                Split(split_min, split) => {
+                                InsertResult::Split(split_min, split) => {
                                     *self = Inner3 {
                                         left: middle,
                                         middle_min: split_min,
@@ -329,14 +197,14 @@ impl Node {
                         }
                         Orphaned(to_merge) => {
                             match right.merge_left(to_merge, right_min) {
-                                Insert::Ok => {
+                                InsertResult::Ok => {
                                     *self = Inner2 {
                                         left,
                                         right_min,
                                         right,
                                     };
                                 }
-                                Split(split_min, split) => {
+                                InsertResult::Split(split_min, split) => {
                                     *self = Inner3 {
                                         left,
                                         middle_min: right_min,
@@ -363,14 +231,14 @@ impl Node {
                         }
                         Orphaned(to_merge) => {
                             match middle.merge_right(right_min, to_merge) {
-                                Insert::Ok => {
+                                InsertResult::Ok => {
                                     *self = Inner2 {
                                         left,
                                         right_min: middle_min,
                                         right: middle,
                                     };
                                 }
-                                Split(split_min, split) => {
+                                InsertResult::Split(split_min, split) => {
                                     *self = Inner3 {
                                         left,
                                         middle_min,
@@ -398,7 +266,7 @@ impl Node {
 
     // Merges subtree as a child on the left side of this node; may result in a split.
     //
-    fn merge_left(&mut self, subtree: Box<Node>, left_min: i32) -> Insert {
+    fn merge_left(&mut self, subtree: Box<Node>, left_min: i32) -> InsertResult {
         let node = std::mem::replace(self, Nil);
         if let Inner2 {
             left,
@@ -413,7 +281,7 @@ impl Node {
                 right_min,
                 right,
             };
-            return Insert::Ok;
+            return InsertResult::Ok;
         }
         if let Inner3 {
             left,
@@ -428,7 +296,7 @@ impl Node {
                 right_min: left_min,
                 right: left,
             };
-            return Split(
+            return InsertResult::Split(
                 middle_min,
                 Box::new(Inner2 {
                     left: middle,
@@ -440,7 +308,7 @@ impl Node {
         panic!("insert_subtree may only be called on an inner node!")
     }
 
-    fn merge_right(&mut self, subtree_min: i32, subtree: Box<Node>) -> Insert {
+    fn merge_right(&mut self, subtree_min: i32, subtree: Box<Node>) -> InsertResult {
         let node = std::mem::replace(self, Nil);
         if let Inner2 {
             left,
@@ -455,7 +323,7 @@ impl Node {
                 right_min: subtree_min,
                 right: subtree,
             };
-            return Insert::Ok;
+            return InsertResult::Ok;
         }
         if let Inner3 {
             left,
@@ -470,7 +338,7 @@ impl Node {
                 right_min: middle_min,
                 right: middle,
             };
-            return Split(
+            return InsertResult::Split(
                 right_min,
                 Box::new(Inner2 {
                     left: right,
@@ -558,8 +426,8 @@ impl Tree {
     }
     fn insert(&mut self, val: i32) {
         match self.root.insert(val) {
-            Insert::Ok => {}
-            Split(split_min, split) => {
+            InsertResult::Ok => {}
+            InsertResult::Split(split_min, split) => {
                 let tmp = std::mem::replace(&mut self.root, Box::new(Nil));
                 self.root = Box::new(Inner2 {
                     left: tmp,
@@ -570,7 +438,7 @@ impl Tree {
         }
     }
     fn remove(&mut self, val: i32) {
-        use Remove::{Drained, NotFound, Ok, Orphaned};
+        use RemoveResult::{Drained, NotFound, Ok, Orphaned};
         match self.root.remove(val) {
             NotFound => {
                 println!("remove => NotFound");
