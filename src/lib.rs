@@ -4,39 +4,128 @@
 #![allow(unused_imports)]
 
 mod node;
-use crate::node::*;
+use crate::node::{Node, Subtree, TreeConfig};
 
-mod insert;
-use crate::insert::{insert_inner2, insert_inner3, insert_leaf3, InsertResult};
+mod update;
+use crate::update::{update_leaf, MergeResult, Update, UpdateResult};
 
-mod remove;
-use crate::remove::RemoveResult;
+use itertools::Itertools;
 
-use Node::{Inner2, Inner3, Leaf2, Leaf3, Nil};
+pub trait BatchUpdate {
+    fn update(&mut self, config: &TreeConfig, batch: Vec<Update>) -> UpdateResult;
+}
 
-impl Node {
-    fn insert(&mut self, new_val: i32) -> InsertResult {
-        use InsertResult::{Ok, Split};
+pub trait SubtreeMerge {
+    fn merge_left(
+        &mut self, //
+        config: &TreeConfig,
+        subtree: Subtree,
+        left_min: i32,
+    ) -> MergeResult;
+
+    fn merge_right(
+        &mut self, //
+        config: &TreeConfig,
+        subtree_min: i32,
+        subtree: Subtree,
+    ) -> MergeResult;
+}
+
+impl Subtree {
+    fn update(&mut self, config: &TreeConfig, batch: Vec<Update>) -> UpdateResult {
+        use Node::{Binary, Nullary, Ternary};
+        use Subtree::{Branch, Leaf, Nil};
+        use UpdateResult::{Done, Merge, Split};
+
         match std::mem::replace(self, Nil) {
             Nil => {
-                *self = Leaf2 { val: new_val };
-                Ok
-            }
-
-            Leaf2 { val } => {
-                *self = Leaf3 {
-                    val1: std::cmp::min(new_val, val),
-                    val2: std::cmp::max(new_val, val),
+                *self = Leaf {
+                    vals: batch.iter().filter_map(|update| update.resolve()).collect(),
                 };
-                Ok
+                Done
             }
-
-            Leaf3 { val1, val2 } => {
-                let (node, result) = insert_leaf3(new_val, (val1, val2));
-                *self = node;
+            Leaf { vals } => {
+                let (leaf, result) = update_leaf(config, batch, vals);
+                *self = leaf;
                 return result;
             }
+            Branch(mut box_node) => match *box_node {
+                Binary {
+                    left,
+                    right_min,
+                    right,
+                } => Done,
+                Ternary {
+                    left,
+                    middle_min,
+                    middle,
+                    right_min,
+                    right,
+                } => Done,
+                Nullary => Done,
+            },
+        }
+    }
 
+    fn merge_left(&mut self, config: &TreeConfig, subtree: Subtree, left_min: i32) -> MergeResult {
+        use MergeResult::Done;
+        use Subtree::{Branch, Leaf, Nil};
+
+        match std::mem::replace(self, Nil) {
+            Nil => panic!("Merging a subtree with Nil does not produce a valid subtree!"),
+            Leaf { vals } => {
+                if let Leaf {
+                    vals: mut subtree_vals,
+                } = subtree
+                {
+                    let (leaf, result) = update_leaf(
+                        config,
+                        subtree_vals.drain(..).map(|val| Update::Put(val)).collect(),
+                        vals,
+                    );
+                    *self = leaf;
+                    Done
+                } else {
+                    panic!("Tried to merge a leaf with a non-leaf!");
+                }
+            }
+            Branch(box_node) => match *box_node {
+                Node::Binary {
+                    left,
+                    right_min,
+                    right,
+                } => Done,
+                Node::Ternary {
+                    left,
+                    middle_min,
+                    middle,
+                    right_min,
+                    right,
+                } => Done,
+                Node::Nullary => Done,
+            },
+        }
+    }
+
+    fn merge_right(
+        &mut self,
+        config: &TreeConfig,
+        subtree_min: i32,
+        subtree: Subtree,
+    ) -> MergeResult {
+        use MergeResult::Done;
+        use Subtree::{Branch, Leaf, Nil};
+
+        Done
+    }
+}
+
+/*
+impl Node {
+    fn update(&mut self, &config: TreeConfig, batch: Vec<Update>) -> UpdateResult {
+        assert_eq!(batch.len(), config.batch_size);
+
+        match std::mem::replace(self, Nil) {
             Inner2 {
                 mut left,
                 right_min,
@@ -529,3 +618,4 @@ mod tests {
         assert_eq!(t.height(), 0);
     }
 }
+*/

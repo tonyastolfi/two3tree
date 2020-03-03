@@ -1,23 +1,27 @@
-#[derive(Clone, Debug)]
-pub enum Node {
-    Inner2 {
-        left: Box<Node>,
-        right_min: i32,
-        right: Box<Node>,
-    },
-    Inner3 {
-        left: Box<Node>,
-        middle_min: i32,
-        middle: Box<Node>,
-        right_min: i32,
-        right: Box<Node>,
-    },
-    Leaf2 {
-        val: i32,
-    },
-    Leaf3 {
-        val1: i32,
-        val2: i32,
-    },
+pub struct TreeConfig {
+    pub batch_size: usize,
+}
+
+#[derive(Debug)]
+pub enum Subtree {
+    Leaf { vals: Vec<i32> },
+    Branch(Box<Node>),
     Nil,
+}
+
+#[derive(Debug)]
+pub enum Node {
+    Binary {
+        left: Subtree,
+        right_min: i32,
+        right: Subtree,
+    },
+    Ternary {
+        left: Subtree,
+        middle_min: i32,
+        middle: Subtree,
+        right_min: i32,
+        right: Subtree,
+    },
+    Nullary,
 }
