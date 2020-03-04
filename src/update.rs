@@ -56,6 +56,18 @@ macro_rules! make_node {
     };
 }
 
+macro_rules! make_branch {
+    [$($x:expr),*] => {
+        Branch(Box::new(make_node![$($x),*]))
+    };
+}
+
+macro_rules! split {
+    [$min:expr, $($x:expr),*] => {
+        Split($min, make_branch![$($x),*])
+    };
+}
+
 macro_rules! updated {
     [$child0:expr, $min1:expr, $child1:expr] => {
         (make_node![$child0, $min1, $child1], Done)
@@ -64,10 +76,7 @@ macro_rules! updated {
         (make_node![$child0, $min1, $child1, $min2, $child2], Done)
     };
     [$child0:expr, $min1:expr, $child1:expr, $min2:expr, $child2:expr, $min3:expr, $child3:expr] => {
-        (
-            make_node![$child0, $min1, $child1],
-            Split($min2, Branch(Box::new(make_node![$child2, $min3, $child3]))),
-        )
+        (make_node![$child0, $min1, $child1], split![$min2, $child2, $min3, $child3])
     };
 }
 
