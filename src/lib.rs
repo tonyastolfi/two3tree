@@ -7,7 +7,9 @@ mod node;
 use crate::node::{Node, Subtree, TreeConfig};
 
 mod update;
-use crate::update::{update_leaf, MergeResult, Update, UpdateResult};
+use crate::update::{
+    update_binary_node, update_leaf, update_ternary_node, MergeResult, Update, UpdateResult,
+};
 
 use itertools::Itertools;
 
@@ -33,6 +35,8 @@ pub trait SubtreeMerge {
 
 impl Subtree {
     fn update(&mut self, config: &TreeConfig, batch: Vec<Update>) -> UpdateResult {
+        assert!(batch.len() <= config.batch_size);
+
         use Node::{Binary, Nullary, Ternary};
         use Subtree::{Branch, Leaf, Nil};
         use UpdateResult::{Done, Merge, Split};
@@ -54,54 +58,98 @@ impl Subtree {
                     left,
                     right_min,
                     right,
-                } => Done,
+                } => {
+                    let (node, result) = update_binary_node(config, batch, left, right_min, right);
+                    *box_node = node;
+                    return result;
+                }
                 Ternary {
                     left,
                     middle_min,
                     middle,
                     right_min,
                     right,
-                } => Done,
+                } => {
+                    let (node, result) = update_ternary_node(
+                        config, batch, left, middle_min, middle, right_min, right,
+                    );
+                    *box_node = node;
+                    return result;
+                }
                 Nullary => Done,
             },
         }
     }
 
     fn merge_left(&mut self, config: &TreeConfig, subtree: Subtree, left_min: i32) -> MergeResult {
-        use MergeResult::Done;
+        use MergeResult::{Done, Split};
         use Subtree::{Branch, Leaf, Nil};
 
         match std::mem::replace(self, Nil) {
             Nil => panic!("Merging a subtree with Nil does not produce a valid subtree!"),
-            Leaf { vals } => {
+            Leaf { mut vals } => {
                 if let Leaf {
                     vals: mut subtree_vals,
                 } = subtree
                 {
-                    let (leaf, result) = update_leaf(
-                        config,
-                        subtree_vals.drain(..).map(|val| Update::Put(val)).collect(),
-                        vals,
-                    );
-                    *self = leaf;
-                    Done
+                    assert!(subtree_vals.len() < config.batch_size);
+
+                    subtree_vals.append(&mut vals);
+                    let mut merged = subtree_vals;
+
+                    assert!(merged.len() <= config.batch_size * 3);
+                    assert!(merged.len() >= config.batch_size);
+
+                    if merged.len() <= config.batch_size * 2 {
+                        *self = Leaf { vals: merged };
+                        return Done;
+                    } else {
+                        let split_vals: Vec<i32> = merged.drain((merged.len() / 2)..).collect();
+                        let split_min: i32 = split_vals[0];
+                        *self = Leaf { vals: merged };
+                        return Split(split_min, Leaf { vals: split_vals });
+                    }
                 } else {
                     panic!("Tried to merge a leaf with a non-leaf!");
                 }
             }
-            Branch(box_node) => match *box_node {
+            Branch(mut box_node) => match *box_node {
                 Node::Binary {
                     left,
                     right_min,
                     right,
-                } => Done,
+                } => {
+                    *box_node = Node::Ternary {
+                        left: subtree,
+                        middle_min: left_min,
+                        middle: left,
+                        right_min,
+                        right,
+                    };
+                    return Done;
+                }
                 Node::Ternary {
                     left,
                     middle_min,
                     middle,
                     right_min,
                     right,
-                } => Done,
+                } => {
+                    let result = Split(
+                        middle_min,
+                        Branch(Box::new(Node::Binary {
+                            left: middle,
+                            right_min,
+                            right,
+                        })),
+                    );
+                    *box_node = Node::Binary {
+                        left: subtree,
+                        right_min: left_min,
+                        right: left,
+                    };
+                    return result;
+                }
                 Node::Nullary => Done,
             },
         }
@@ -113,10 +161,77 @@ impl Subtree {
         subtree_min: i32,
         subtree: Subtree,
     ) -> MergeResult {
-        use MergeResult::Done;
+        use MergeResult::{Done, Split};
         use Subtree::{Branch, Leaf, Nil};
 
-        Done
+        match std::mem::replace(self, Nil) {
+            Nil => panic!("Merging a subtree with Nil does not produce a valid subtree!"),
+            Leaf { mut vals } => {
+                if let Leaf {
+                    vals: mut subtree_vals,
+                } = subtree
+                {
+                    assert!(subtree_vals.len() < config.batch_size);
+
+                    vals.append(&mut subtree_vals);
+                    let mut merged = vals;
+
+                    assert!(merged.len() <= config.batch_size * 3);
+                    assert!(merged.len() >= config.batch_size);
+
+                    if merged.len() <= config.batch_size * 2 {
+                        *self = Leaf { vals: merged };
+                        return Done;
+                    } else {
+                        let split_vals: Vec<i32> = merged.drain((merged.len() / 2)..).collect();
+                        let split_min: i32 = split_vals[0];
+                        *self = Leaf { vals: merged };
+                        return Split(split_min, Leaf { vals: split_vals });
+                    }
+                } else {
+                    panic!("Tried to merge a leaf with a non-leaf!");
+                }
+            }
+            Branch(mut box_node) => match *box_node {
+                Node::Binary {
+                    left,
+                    right_min,
+                    right,
+                } => {
+                    *box_node = Node::Ternary {
+                        left,
+                        middle_min: right_min,
+                        middle: right,
+                        right_min: subtree_min,
+                        right: subtree,
+                    };
+                    return Done;
+                }
+                Node::Ternary {
+                    left,
+                    middle_min,
+                    middle,
+                    right_min,
+                    right,
+                } => {
+                    let result = Split(
+                        right_min,
+                        Branch(Box::new(Node::Binary {
+                            left: right,
+                            right_min: subtree_min,
+                            right: subtree,
+                        })),
+                    );
+                    *box_node = Node::Binary {
+                        left,
+                        right_min: middle_min,
+                        right: middle,
+                    };
+                    return result;
+                }
+                Node::Nullary => Done,
+            },
+        }
     }
 }
 
