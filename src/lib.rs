@@ -104,7 +104,7 @@ macro_rules! split {
         UpdateResult::Split(
             Subtree::Branch($branch),
             $min,
-            make_branch![$(x),*],
+            make_branch![$($x),*],
         )
     };
 }
@@ -135,6 +135,27 @@ macro_rules! update_branch {
     }};
 }
 
+pub fn fuse(config: &TreeConfig, left: Orphan, right_min: i32, right: Orphan) -> Subtree {
+    use Orphan::{Child, Items};
+
+    match (left, right) {
+        (Items(left_vals), Items(mut right_vals)) => {
+            assert!(left_vals.len() + right_vals.len() >= config.batch_size);
+
+            let mut vals = left_vals;
+            vals.append(&mut right_vals);
+
+            Subtree::Leaf { vals }
+        }
+        (Child(left_subtree), Child(right_subtree)) => {
+            make_branch![left_subtree, right_min, right_subtree]
+        }
+        _ => {
+            panic!("fuse must be called on like items.");
+        }
+    }
+}
+
 //--------------------------------------------------------
 #[derive(Debug)]
 pub enum Subtree {
@@ -150,17 +171,18 @@ impl Subtree {
     }
 
     fn merge_left(self, config: &TreeConfig, orphan: Orphan, left_min: i32) -> MergeResult {
-        MergeResult::Done
+        MergeResult::Done(self)
     }
 
     fn merge_right(self, config: &TreeConfig, orphan_min: i32, orphan: Orphan) -> MergeResult {
-        MergeResult::Done
+        MergeResult::Done(self)
     }
 
     fn update(self, config: &TreeConfig, batch: Vec<Update>) -> UpdateResult {
         assert!(batch.len() <= config.batch_size);
 
         use Node::{Binary, Ternary};
+        use Orphan::{Child, Items};
         use Subtree::{Branch, Leaf};
         use UpdateResult::{Done, Merge, Split};
 
@@ -197,9 +219,7 @@ impl Subtree {
                             ),
                             Merge(right_orphan) => {
                                 match left.merge_right(config, right_min, right_orphan) {
-                                    MergeResult::Done(left) => {
-                                        update_branch!(branch, left, right_min, right)
-                                    }
+                                    MergeResult::Done(left) => Merge(Child(left)),
                                     MergeResult::Split(left, split_min, split) => {
                                         update_branch!(branch, left, split_min, split)
                                     }
@@ -230,49 +250,37 @@ impl Subtree {
                             Merge(right_orphan) => {
                                 match left_split1.merge_right(config, right_min, right_orphan) {
                                     MergeResult::Done(left_split1) => {
-                                        updated![left, left_split1_min, left_split1]
+                                        update_branch!(branch, left, left_split1_min, left_split1)
                                     }
-                                    MergeResult::Split(left_split1, left_split2_min, left_split2) => updated![
+                                    MergeResult::Split(
+                                        left_split1,
+                                        left_split2_min,
+                                        left_split2,
+                                    ) => update_branch!(
+                                        branch,
                                         left,
                                         left_split1_min,
                                         left_split1,
                                         left_split2_min,
                                         left_split2
-                                    ],
+                                    ),
                                 }
                             }
                         },
-                        Merge(left_orphan) =>{
-                            match right.merge_left(config, left_orphan, right_min) {
-                                MergeResult::Done(right) => {
-                                    match right.update(config, right_batch) {
-                                        
-                                    }
-                                    update_branch!(branch, right, right_split1_min, right_split1)
-                                }
-                                MergeResult::Split(right, right_split0_min, right_split0) => {
-                                    update_branch!(branch,                                    right,
-                                    right_split0_min,
-                                    right_split0,
-                                    right_split1_min,
-                                    right_split1
-                                    )}
-                            }
-                            /*
-                            match right.update(config, right_batch) {
-                            Done => match right.merge_left(config, left_orphan, right_min) {
-                                MergeResult::Done => (Node::Nullary, Merge(right)),
-                                MergeResult::Split(right_split_min, right_split) => {
-                                    updated![right, right_split_min, right_split]
+                        Merge(left_orphan) => match right.update(config, right_batch) {
+                            Done(right) => match right.merge_left(config, left_orphan, right_min) {
+                                MergeResult::Done(right) => Merge(Child(right)),
+                                MergeResult::Split(right, right_split_min, right_split) => {
+                                    update_branch!(branch, right, right_split_min, right_split)
                                 }
                             },
-                            Split(right_split1_min, right_split1) => {
+                            Split(right, right_split_min, right_split) => {
+                                update_branch!(branch, right, right_split_min, right_split)
                             }
                             Merge(right_orphan) => {
-                                merge_required(make_branch![left_orphan, right_min, right_orphan])
+                                Merge(Child(fuse(config, left_orphan, right_min, right_orphan)))
                             }
-                            },}
-*/
+                        },
                     };
                 } else {
                     return Done(Branch(branch));
