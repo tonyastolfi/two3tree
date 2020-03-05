@@ -6,7 +6,6 @@ pub struct TreeConfig {
 pub enum Subtree {
     Leaf { vals: Vec<i32> },
     Branch(Box<Node>),
-    Nil,
 }
 
 #[derive(Debug)]
@@ -23,5 +22,4 @@ pub enum Node {
         right_min: i32,
         right: Subtree,
     },
-    Nullary,
 }

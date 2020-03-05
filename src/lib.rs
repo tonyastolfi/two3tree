@@ -1,118 +1,349 @@
 #![allow(dead_code)]
+#![allow(unused_macros)]
 #![allow(unused_variables)]
 #![allow(unused_mut)]
 #![allow(unused_imports)]
 
-mod node;
-use crate::node::{Node, Subtree, TreeConfig};
+//mod node;
+//use crate::node::{Node, Subtree, TreeConfig};
 
-mod update;
-use crate::update::{
-    update_binary_node, update_leaf, update_ternary_node, MergeResult, Update, UpdateResult,
-};
+//mod update;
+//use crate::update::{
+//    update_binary_node, update_leaf, update_ternary_node, MergeResult, Update, UpdateResult,
+//};
 
 use itertools::Itertools;
 
-pub trait BatchUpdate {
-    fn update(&mut self, config: &TreeConfig, batch: Vec<Update>) -> UpdateResult;
+pub struct TreeConfig {
+    pub batch_size: usize,
 }
 
-pub trait SubtreeMerge {
-    fn merge_left(
-        &mut self, //
-        config: &TreeConfig,
-        subtree: Subtree,
-        left_min: i32,
-    ) -> MergeResult;
+#[derive(Debug)]
+pub enum Node {
+    Binary {
+        left: Subtree,
+        right_min: i32,
+        right: Subtree,
+    },
+    Ternary {
+        left: Subtree,
+        middle_min: i32,
+        middle: Subtree,
+        right_min: i32,
+        right: Subtree,
+    },
+}
 
-    fn merge_right(
-        &mut self, //
-        config: &TreeConfig,
-        subtree_min: i32,
-        subtree: Subtree,
-    ) -> MergeResult;
+//--------------------------------------------------------
+pub enum Update {
+    Put(i32),
+    Delete(i32),
+}
+
+impl Update {
+    pub fn key<'a>(&'a self) -> &'a i32 {
+        use Update::{Delete, Put};
+        match self {
+            Put(key) => key,
+            Delete(key) => key,
+        }
+    }
+    pub fn resolve(&self) -> Option<i32> {
+        use Update::{Delete, Put};
+        match self {
+            Put(key) => Some(*key),
+            Delete(key) => None,
+        }
+    }
+}
+//--------------------------------------------------------
+
+pub enum UpdateResult {
+    Done(Subtree),
+    Split(Subtree, i32, Subtree),
+    Merge(Orphan),
+}
+
+pub enum Orphan {
+    Items(Vec<i32>),
+    Child(Subtree),
+}
+
+pub enum MergeResult {
+    Done(Subtree),
+    Split(Subtree, i32, Subtree),
+}
+
+macro_rules! make_node {
+    [$child0:expr, $min1:expr, $child1:expr] => {
+        Node::Binary {
+            left: $child0,
+            right_min: $min1,
+            right: $child1,
+        }
+    };
+    [$child0:expr, $min1:expr, $child1:expr, $min2:expr, $child2:expr] => {
+        Node::Ternary {
+            left: $child0,
+            middle_min: $min1,
+            middle: $child1,
+            right_min: $min2,
+            right: $child2,
+        }
+    };
+}
+
+macro_rules! make_branch {
+    [$($x:expr),*] => {
+        Subtree::Branch(Box::new(make_node![$($x),*]))
+    };
+}
+
+macro_rules! split {
+    [$branch:expr, $min:expr, $($x:expr),*] => {
+        UpdateResult::Split(
+            Subtree::Branch($branch),
+            $min,
+            make_branch![$(x),*],
+        )
+    };
+}
+
+macro_rules! update_branch {
+    ($branch:expr, $child0:expr, $min1:expr, $child1:expr) => {{
+        *$branch = make_node![$child0, $min1, $child1];
+        UpdateResult::Done(Subtree::Branch($branch))
+    }};
+    ($branch:expr, $child0:expr, $min1:expr, $child1:expr, $min2:expr, $child2:expr) => {{
+        *$branch = make_node![$child0, $min1, $child1, $min2, $child2];
+        UpdateResult::Done(Subtree::Branch($branch))
+    }};
+    ($branch:expr, $child0:expr, $min1:expr, $child1:expr,
+     $min2:expr, $child2:expr, $min3:expr, $child3:expr) => {{
+        *$branch = make_node![$child0, $min1, $child1];
+        split![$branch, $min2, $child2, $min3, $child3]
+    }};
+    ($branch:expr, $child0:expr, $min1:expr, $child1:expr, $min2:expr, $child2:expr,
+     $min3:expr, $child3:expr, $min4:expr, $child4:expr) => {{
+        *$branch = make_node![$child0, $min1, $child1, $min2, $child2];
+        split![$min3, $child3, $min4, $child4]
+    }};
+    ($branch:expr, $child0:expr, $min1:expr, $child1:expr, $min2:expr, $child2:expr,
+     $min3:expr, $child3:expr, $min4:expr, $child4:expr, $min5:expr, $child5:expr) => {{
+        *$branch = make_node![$child0, $min1, $child1, $min2, $child2];
+        split![$min3, $child3, $min4, $child4, $min5, $child5]
+    }};
+}
+
+//--------------------------------------------------------
+#[derive(Debug)]
+pub enum Subtree {
+    Leaf { vals: Vec<i32> },
+    Branch(Box<Node>),
 }
 
 impl Subtree {
-    fn update(&mut self, config: &TreeConfig, batch: Vec<Update>) -> UpdateResult {
-        assert!(batch.len() <= config.batch_size);
-
-        use Node::{Binary, Nullary, Ternary};
-        use Subtree::{Branch, Leaf, Nil};
-        use UpdateResult::{Done, Merge, Split};
-
-        match std::mem::replace(self, Nil) {
-            Nil => {
-                *self = Leaf {
-                    vals: batch.iter().filter_map(|update| update.resolve()).collect(),
-                };
-                Done
-            }
-            Leaf { vals } => {
-                let (leaf, result) = update_leaf(config, batch, vals);
-                *self = leaf;
-                return result;
-            }
-            Branch(mut box_node) => match *box_node {
-                Binary {
-                    left,
-                    right_min,
-                    right,
-                } => {
-                    let (node, result) = update_binary_node(config, batch, left, right_min, right);
-                    *box_node = node;
-                    return result;
-                }
-                Ternary {
-                    left,
-                    middle_min,
-                    middle,
-                    right_min,
-                    right,
-                } => {
-                    let (node, result) = update_ternary_node(
-                        config, batch, left, middle_min, middle, right_min, right,
-                    );
-                    *box_node = node;
-                    return result;
-                }
-                Nullary => Done,
-            },
+    fn new(batch: Vec<Update>) -> Self {
+        Subtree::Leaf {
+            vals: batch.iter().filter_map(|update| update.resolve()).collect(),
         }
     }
 
-    fn merge_left(&mut self, config: &TreeConfig, subtree: Subtree, left_min: i32) -> MergeResult {
-        use MergeResult::{Done, Split};
-        use Subtree::{Branch, Leaf, Nil};
+    fn merge_left(self, config: &TreeConfig, orphan: Orphan, left_min: i32) -> MergeResult {
+        MergeResult::Done
+    }
 
-        match std::mem::replace(self, Nil) {
-            Nil => panic!("Merging a subtree with Nil does not produce a valid subtree!"),
-            Leaf { mut vals } => {
-                if let Leaf {
-                    vals: mut subtree_vals,
-                } = subtree
+    fn merge_right(self, config: &TreeConfig, orphan_min: i32, orphan: Orphan) -> MergeResult {
+        MergeResult::Done
+    }
+
+    fn update(self, config: &TreeConfig, batch: Vec<Update>) -> UpdateResult {
+        assert!(batch.len() <= config.batch_size);
+
+        use Node::{Binary, Ternary};
+        use Subtree::{Branch, Leaf};
+        use UpdateResult::{Done, Merge, Split};
+
+        match self {
+            Leaf { vals } => update_leaf(config, batch, vals),
+            Branch(mut branch) => {
+                use Subtree::{Branch, Leaf};
+                use UpdateResult::{Done, Merge, Split};
+
+                if let Node::Binary {
+                    left,
+                    right_min,
+                    right,
+                } = *branch
                 {
-                    assert!(subtree_vals.len() < config.batch_size);
-
-                    subtree_vals.append(&mut vals);
-                    let mut merged = subtree_vals;
-
-                    assert!(merged.len() <= config.batch_size * 3);
-                    assert!(merged.len() >= config.batch_size);
-
-                    if merged.len() <= config.batch_size * 2 {
-                        *self = Leaf { vals: merged };
-                        return Done;
-                    } else {
-                        let split_vals: Vec<i32> = merged.drain((merged.len() / 2)..).collect();
-                        let split_min: i32 = split_vals[0];
-                        *self = Leaf { vals: merged };
-                        return Split(split_min, Leaf { vals: split_vals });
+                    if batch.is_empty() {
+                        return update_branch!(branch, left, right_min, right);
                     }
+
+                    let (left_batch, right_batch): (Vec<Update>, Vec<Update>) = batch
+                        .into_iter()
+                        .partition(|update| update.key() < &right_min);
+
+                    return match left.update(config, left_batch) {
+                        Done(left) => match right.update(config, right_batch) {
+                            Done(right) => update_branch!(branch, left, right_min, right),
+                            Split(right, right_split_min, right_split) => update_branch!(
+                                branch,
+                                left,
+                                right_min,
+                                right,
+                                right_split_min,
+                                right_split
+                            ),
+                            Merge(right_orphan) => {
+                                match left.merge_right(config, right_min, right_orphan) {
+                                    MergeResult::Done(left) => {
+                                        update_branch!(branch, left, right_min, right)
+                                    }
+                                    MergeResult::Split(left, split_min, split) => {
+                                        update_branch!(branch, left, split_min, split)
+                                    }
+                                }
+                            }
+                        },
+                        Split(left, left_split1_min, mut left_split1) => match right
+                            .update(config, right_batch)
+                        {
+                            Done(right) => update_branch!(
+                                branch,
+                                left,
+                                left_split1_min,
+                                left_split1,
+                                right_min,
+                                right
+                            ),
+                            Split(right, right_split_min, right_split) => update_branch!(
+                                branch,
+                                left,
+                                left_split1_min,
+                                left_split1,
+                                right_min,
+                                right,
+                                right_split_min,
+                                right_split
+                            ),
+                            Merge(right_orphan) => {
+                                match left_split1.merge_right(config, right_min, right_orphan) {
+                                    MergeResult::Done(left_split1) => {
+                                        updated![left, left_split1_min, left_split1]
+                                    }
+                                    MergeResult::Split(left_split1, left_split2_min, left_split2) => updated![
+                                        left,
+                                        left_split1_min,
+                                        left_split1,
+                                        left_split2_min,
+                                        left_split2
+                                    ],
+                                }
+                            }
+                        },
+                        Merge(left_orphan) =>{
+                            match right.merge_left(config, left_orphan, right_min) {
+                                MergeResult::Done(right) => {
+                                    match right.update(config, right_batch) {
+                                        
+                                    }
+                                    update_branch!(branch, right, right_split1_min, right_split1)
+                                }
+                                MergeResult::Split(right, right_split0_min, right_split0) => {
+                                    update_branch!(branch,                                    right,
+                                    right_split0_min,
+                                    right_split0,
+                                    right_split1_min,
+                                    right_split1
+                                    )}
+                            }
+                            /*
+                            match right.update(config, right_batch) {
+                            Done => match right.merge_left(config, left_orphan, right_min) {
+                                MergeResult::Done => (Node::Nullary, Merge(right)),
+                                MergeResult::Split(right_split_min, right_split) => {
+                                    updated![right, right_split_min, right_split]
+                                }
+                            },
+                            Split(right_split1_min, right_split1) => {
+                            }
+                            Merge(right_orphan) => {
+                                merge_required(make_branch![left_orphan, right_min, right_orphan])
+                            }
+                            },}
+*/
+                    };
                 } else {
-                    panic!("Tried to merge a leaf with a non-leaf!");
+                    return Done(Branch(branch));
                 }
             }
+        }
+    }
+}
+
+pub fn update_leaf(config: &TreeConfig, batch: Vec<Update>, vals: Vec<i32>) -> UpdateResult {
+    use itertools::EitherOrBoth::{Both, Left, Right};
+    use Orphan::Items;
+    use Subtree::Leaf;
+    use UpdateResult::{Done, Merge, Split};
+
+    let mut merged: Vec<i32> = vals
+        .iter()
+        .merge_join_by(batch.iter(), |old, update| old.cmp(&update.key()))
+        .filter_map(|either| match either {
+            Left(old) => Some(*old),
+            Right(update) => update.resolve(),
+            Both(_old, update) => update.resolve(),
+        })
+        .collect();
+
+    assert!(merged.len() <= config.batch_size * 3);
+
+    if merged.len() < config.batch_size {
+        return Merge(Items(merged));
+    }
+
+    if merged.len() <= config.batch_size * 2 {
+        return Done(Leaf { vals: merged });
+    }
+
+    let split_vals: Vec<i32> = merged.drain((merged.len() / 2)..).collect();
+    let split_min: i32 = split_vals[0];
+    return Split(Leaf { vals: merged }, split_min, Leaf { vals: split_vals });
+}
+
+/*
+    fn merge_left(&mut self, config: &TreeConfig, subtree: Subtree, left_min: i32) -> MergeResult {
+        use MergeResult::{Done, Split};
+        use Subtree::{Branch, Leaf};
+
+        match (subtree, std::mem::replace(self, Nil)) {
+            (
+                Leaf {
+                    vals: mut subtree_vals,
+                },
+                Leaf { vals },
+            ) => {
+                assert!(subtree_vals.len() < config.batch_size);
+
+                subtree_vals.append(&mut vals);
+                let mut merged = subtree_vals;
+
+                assert!(merged.len() < config.batch_size * 3);
+                assert!(merged.len() >= config.batch_size);
+
+                if merged.len() <= config.batch_size * 2 {
+                    *self = Leaf { vals: merged };
+                    return Done;
+                } else {
+                    let split_vals: Vec<i32> = merged.drain((merged.len() / 2)..).collect();
+                    let split_min: i32 = split_vals[0];
+                    *self = Leaf { vals: merged };
+                    return Split(split_min, Leaf { vals: split_vals });
+                }
+            }
+            (Branch(mut subtree_branch), Branch(mut branch)) => match (*subtree_branch, *branch) {},
             Branch(mut box_node) => match *box_node {
                 Node::Binary {
                     left,
@@ -152,6 +383,7 @@ impl Subtree {
                 }
                 Node::Nullary => Done,
             },
+            _ => panic!("Merging a subtree with Nil does not produce a valid subtree!"),
         }
     }
 
@@ -235,7 +467,6 @@ impl Subtree {
     }
 }
 
-/*
 impl Node {
     fn update(&mut self, &config: TreeConfig, batch: Vec<Update>) -> UpdateResult {
         assert_eq!(batch.len(), config.batch_size);
