@@ -242,6 +242,168 @@ pub fn update_leaf(config: &TreeConfig, batch: Vec<Update>, vals: Vec<i32>) -> U
     return Split(Leaf { vals: merged }, split_min, Leaf { vals: split_vals });
 }
 
+enum NodeBuilderState {
+    Empty,
+    MergeLeft(Orphan),
+    Branch1(Subtree),
+    Branch2(Subtree, i32, Subtree),
+    Branch3(Subtree, i32, Subtree, i32, Subtree),
+    Branch4(Subtree, i32, Subtree, i32, Subtree, i32, Subtree),
+    Branch5(
+        Subtree,
+        i32,
+        Subtree,
+        i32,
+        Subtree,
+        i32,
+        Subtree,
+        i32,
+        Subtree,
+    ),
+    Branch6(
+        Subtree,
+        i32,
+        Subtree,
+        i32,
+        Subtree,
+        i32,
+        Subtree,
+        i32,
+        Subtree,
+        i32,
+        Subtree,
+    ),
+}
+impl NodeBuilderState {
+    fn new() -> Self {
+        Self::Empty
+    }
+    fn update_first(&mut self, first: UpdateResult) {
+        use NodeBuilderState::*;
+        use UpdateResult::*;
+
+        match (std::mem::replace(self, Empty), first) {
+            (Empty, Done(b0)) => {
+                *self = Branch1(b0);
+            }
+            (Empty, Split(b0, m1, b1)) => {
+                *self = Branch2(b0, m1, b1);
+            }
+            (Empty, Merge(orphan)) => {
+                *self = MergeLeft(orphan);
+            }
+            _ => panic!("update_first may only be called once!"),
+        }
+    }
+    fn update_next(&mut self, config: &TreeConfig, next_min: i32, next: UpdateResult) {
+        use NodeBuilderState::*;
+        use UpdateResult::*;
+
+        match (std::mem::replace(self, Empty), next_min, next) {
+            // Fuse case - 0 => 1
+            //
+            (MergeLeft(o0), m1, Merge(o1)) => {
+                *self = Branch1(fuse2(config, o0, m1, o1));
+            }
+            // Done cases - grow by 1
+            //
+            (Branch1(b0), m1, Done(b1)) => {
+                *self = Branch2(b0, m1, b1);
+            }
+            (Branch2(b0, m1, b1), m2, Done(b2)) => {
+                *self = Branch3(b0, m1, b1, m2, b2);
+            }
+            (Branch3(b0, m1, b1, m2, b2), m3, Done(b3)) => {
+                *self = Branch4(b0, m1, b1, m2, b2, m3, b3);
+            }
+            (Branch4(b0, m1, b1, m2, b2, m3, b3), m4, Done(b4)) => {
+                *self = Branch5(b0, m1, b1, m2, b2, m3, b3, m4, b4);
+            }
+            (Branch5(b0, m1, b1, m2, b2, m3, b3, m4, b4), m5, Done(b5)) => {
+                *self = Branch6(b0, m1, b1, m2, b2, m3, b3, m4, b4, m5, b5);
+            }
+            // Split cases - grow by 2
+            //
+            (Branch1(b0), m1, Split(b1, m2, b2)) => {
+                *self = Branch3(b0, m1, b1, m2, b2);
+            }
+            (Branch2(b0, m1, b1), m2, Split(b2, m3, b3)) => {
+                *self = Branch4(b0, m1, b1, m2, b2, m3, b3);
+            }
+            (Branch3(b0, m1, b1, m2, b2), m3, Split(b3, m4, b4)) => {
+                *self = Branch5(b0, m1, b1, m2, b2, m3, b3, m4, b4);
+            }
+            (Branch4(b0, m1, b1, m2, b2, m3, b3), m4, Split(b4, m5, b5)) => {
+                *self = Branch6(b0, m1, b1, m2, b2, m3, b3, m4, b4, m5, b5);
+            }
+            // Merge cases - grow by 0 or 1
+            //
+            (MergeLeft(o0), m1, Done(b1)) => {}
+            (MergeLeft(o0), m1, Split(b1, m2, b2)) => {}
+            (Branch1(b0), m1, Merge(orphan)) => {
+                *self = match b0.merge_right(config, m1, orphan) {
+                    MergeResult::Done(b0) => Branch1(b0),
+                    MergeResult::Split(b0, m1, b1) => Branch2(b0, m1, b1),
+                };
+            }
+            (Branch2(b0, m1, b1), m2, Merge(orphan)) => {
+                *self = match b1.merge_right(config, m2, orphan) {
+                    MergeResult::Done(b1) => Branch2(b0, m1, b1),
+                    MergeResult::Split(b1, m2, b2) => Branch3(b0, m1, b1, m2, b2),
+                };
+            }
+            (Branch3(b0, m1, b1, m2, b2), m3, Merge(orphan)) => {
+                *self = match b2.merge_right(config, m2, orphan) {
+                    MergeResult::Done(b2) => Branch3(b0, m1, b1, m2, b2),
+                    MergeResult::Split(b2, m3, b3) => Branch4(b0, m1, b1, m2, b2, m3, b3),
+                };
+            }
+            (Branch4(b0, m1, b1, m2, b2, m3, b3), m4, Merge(orphan)) => {
+                *self = match b3.merge_right(config, m4, orphan) {
+                    MergeResult::Done(b3) => Branch4(b0, m1, b1, m2, b2, m3, b3),
+                    MergeResult::Split(b3, m4, b4) => Branch5(b0, m1, b1, m2, b2, m3, b3, m4, b4),
+                };
+            }
+            (Branch5(b0, m1, b1, m2, b2, m3, b3, m4, b4), m5, Merge(orphan)) => {
+                *self = match b4.merge_right(config, m5, orphan) {
+                    MergeResult::Done(b4) => Branch5(b0, m1, b1, m2, b2, m3, b3, m4, b4),
+                    MergeResult::Split(b4, m5, b5) => {
+                        Branch6(b0, m1, b1, m2, b2, m3, b3, m4, b4, m5, b5)
+                    }
+                };
+            }
+            _ => panic!("update_next state error!"),
+        }
+    }
+}
+
+enum NodeBuilderBuffer {
+    Empty,
+    FirstBranch(Subtree),
+    NextBranch(i32, Subtree),
+    FirstOrphan(Orphan),
+    NextOrphan(i32, Orphan),
+}
+
+struct NodeBuilder {
+    state: NodeBuilderState,
+    buffer: NodeBuilderBuffer,
+}
+
+impl NodeBuilder {
+    /*
+    fn build(self) -> UpdateResult {
+        use NodeBuilderBuffer::*;
+        use NodeBuilderState::*;
+        use UpdateResult::*;
+
+        match (self.state, self.buffer) {
+            (Branch1(b0), NextBranch(m1, b1)) => Done(make_branch![b0, m1, b1]),
+            (Branch2(b0, m1, b1), NextBranch(
+        }
+    }*/
+}
+
 pub fn update_binary_node(
     config: &TreeConfig,
     mut branch: Box<Node>,
