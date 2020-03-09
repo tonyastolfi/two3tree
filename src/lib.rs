@@ -180,41 +180,13 @@ macro_rules! split {
     };
 }
 
-macro_rules! update_branch {
-    ($branch:expr, $child0:expr) => {{
-        UpdateResult::Merge(Orphan::Child($child0))
-    }};
-    ($branch:expr, $child0:expr, $min1:expr, $child1:expr) => {{
-        *$branch = make_node![$child0, $min1, $child1];
-        UpdateResult::Done(Subtree::Branch($branch))
-    }};
-    ($branch:expr, $child0:expr, $min1:expr, $child1:expr, $min2:expr, $child2:expr) => {{
-        *$branch = make_node![$child0, $min1, $child1, $min2, $child2];
-        UpdateResult::Done(Subtree::Branch($branch))
-    }};
-    ($branch:expr, $child0:expr, $min1:expr, $child1:expr,
-     $min2:expr, $child2:expr, $min3:expr, $child3:expr) => {{
-        *$branch = make_node![$child0, $min1, $child1];
-        split![$branch, $min2, $child2, $min3, $child3]
-    }};
-    ($branch:expr, $child0:expr, $min1:expr, $child1:expr, $min2:expr, $child2:expr,
-     $min3:expr, $child3:expr, $min4:expr, $child4:expr) => {{
-        *$branch = make_node![$child0, $min1, $child1, $min2, $child2];
-        split![$branch, $min3, $child3, $min4, $child4]
-    }};
-    ($branch:expr, $child0:expr, $min1:expr, $child1:expr, $min2:expr, $child2:expr,
-     $min3:expr, $child3:expr, $min4:expr, $child4:expr, $min5:expr, $child5:expr) => {{
-        *$branch = make_node![$child0, $min1, $child1, $min2, $child2];
-        split![$branch, $min3, $child3, $min4, $child4, $min5, $child5]
-    }};
-}
-
 pub fn fuse_vals(mut v0: Vec<i32>, mut v1: Vec<i32>) -> Vec<i32> {
+    assert!(v0.last() <= v1.first());
     v0.append(&mut v1);
     v0
 }
 
-pub fn fuse2(config: &TreeConfig, left: Orphan, right_min: i32, right: Orphan) -> Subtree {
+pub fn fuse_orphans(config: &TreeConfig, left: Orphan, right_min: i32, right: Orphan) -> Subtree {
     use Orphan::{Child, Items};
 
     match (left, right) {
@@ -263,6 +235,10 @@ impl Viable for Subtree {
 }
 
 impl Subtree {
+    fn empty() -> Self {
+        Subtree::Leaf { vals: vec![] }
+    }
+
     fn new(batch: Vec<Update>) -> Self {
         Subtree::Leaf {
             vals: batch.iter().filter_map(|update| update.resolve()).collect(),
@@ -528,7 +504,7 @@ impl NodeBuilder {
         match (self, next_min, next) {
             // Fuse case - 0 => 1
             //
-            (MergeLeft(o0), m1, Merge(o1)) => Branch1(fuse2(config, o0, m1, o1)),
+            (MergeLeft(o0), m1, Merge(o1)) => Branch1(fuse_orphans(config, o0, m1, o1)),
             // Done cases - grow by 1
             //
             (Branch1(b0), m1, Done(b1)) => Branch2(b0, m1, b1),
@@ -597,7 +573,12 @@ impl NodeBuilder {
 pub fn update_node(config: &TreeConfig, mut branch: Box<Node>, batch: Vec<Update>) -> UpdateResult {
     use NodeBuilder::*;
     use Orphan::Child;
+    use Subtree::Branch;
     use UpdateResult::{Done, Merge, Split};
+
+    if batch.is_empty() {
+        return Done(Subtree::Branch(branch));
+    }
 
     let builder = {
         if let Node::Binary {
@@ -607,10 +588,6 @@ pub fn update_node(config: &TreeConfig, mut branch: Box<Node>, batch: Vec<Update
             right,
         } = *branch
         {
-            if batch.is_empty() {
-                return update_branch!(branch, left, right_min, right);
-            }
-
             let (left_batch, right_batch): (Vec<Update>, Vec<Update>) = batch
                 .into_iter()
                 .partition(|update| update.key() < &right_min);
@@ -629,10 +606,6 @@ pub fn update_node(config: &TreeConfig, mut branch: Box<Node>, batch: Vec<Update
             right,
         } = *branch
         {
-            if batch.is_empty() {
-                return update_branch!(branch, left, middle_min, middle, right_min, right);
-            }
-
             let (left_batch, non_left_batch): (Vec<Update>, Vec<Update>) = batch
                 .into_iter()
                 .partition(|update| update.key() < &middle_min);
@@ -650,24 +623,30 @@ pub fn update_node(config: &TreeConfig, mut branch: Box<Node>, batch: Vec<Update
     };
 
     return match builder {
-        Branch1(b0) => update_branch!(branch, b0),
+        Branch1(b0) => Merge(Child(b0)),
         Branch2(b0, m1, b1) => {
             assert!(b0.is_viable(config));
             assert!(b1.is_viable(config));
-            update_branch!(branch, b0, m1, b1)
+
+            *branch = make_node![b0, m1, b1];
+            Done(Branch(branch))
         }
         Branch3(b0, m1, b1, m2, b2) => {
             assert!(b0.is_viable(config));
             assert!(b1.is_viable(config));
             assert!(b2.is_viable(config));
-            update_branch!(branch, b0, m1, b1, m2, b2)
+
+            *branch = make_node![b0, m1, b1, m2, b2];
+            Done(Branch(branch))
         }
         Branch4(b0, m1, b1, m2, b2, m3, b3) => {
             assert!(b0.is_viable(config));
             assert!(b1.is_viable(config));
             assert!(b2.is_viable(config));
             assert!(b3.is_viable(config));
-            update_branch!(branch, b0, m1, b1, m2, b2, m3, b3)
+
+            *branch = make_node![b0, m1, b1];
+            split![branch, m2, b2, m3, b3]
         }
         Branch5(b0, m1, b1, m2, b2, m3, b3, m4, b4) => {
             assert!(b0.is_viable(config));
@@ -675,7 +654,9 @@ pub fn update_node(config: &TreeConfig, mut branch: Box<Node>, batch: Vec<Update
             assert!(b2.is_viable(config));
             assert!(b3.is_viable(config));
             assert!(b4.is_viable(config));
-            update_branch!(branch, b0, m1, b1, m2, b2, m3, b3, m4, b4)
+
+            *branch = make_node![b0, m1, b1, m2, b2];
+            split![branch, m3, b3, m4, b4]
         }
         Branch6(b0, m1, b1, m2, b2, m3, b3, m4, b4, m5, b5) => {
             assert!(b0.is_viable(config));
@@ -684,7 +665,9 @@ pub fn update_node(config: &TreeConfig, mut branch: Box<Node>, batch: Vec<Update
             assert!(b3.is_viable(config));
             assert!(b4.is_viable(config));
             assert!(b5.is_viable(config));
-            update_branch!(branch, b0, m1, b1, m2, b2, m3, b3, m4, b4, m5, b5)
+
+            *branch = make_node![b0, m1, b1, m2, b2];
+            split![branch, m3, b3, m4, b4, m5, b5]
         }
         _ => panic!("update error! builder={:?}", builder),
     };
@@ -700,7 +683,7 @@ impl Tree {
     fn new(config: TreeConfig) -> Self {
         Self {
             config,
-            root: Subtree::Leaf { vals: Vec::new() },
+            root: Subtree::empty(),
         }
     }
 
@@ -717,21 +700,23 @@ impl Tree {
         use Subtree::{Branch, Leaf};
         use UpdateResult::{Done, Merge, Split};
 
-        let root = std::mem::replace(&mut self.root, Leaf { vals: Vec::new() });
-        match root.update(&self.config, batch) {
-            Done(b0) => {
-                self.root = b0;
-            }
-            Split(b0, m1, b1) => {
-                self.root = make_branch![b0, m1, b1];
-            }
-            Merge(orphan) => {
-                self.root = match orphan {
-                    Items(vals) => Leaf { vals },
-                    Child(branch) => branch,
-                }
-            }
-        }
+        let root = std::mem::replace(&mut self.root, Subtree::empty());
+        self.root = match root.update(&self.config, batch) {
+            // Tree height stays the same.
+            //
+            Done(b0) => b0,
+
+            // Tree height grows (due to split).
+            //
+            Split(b0, m1, b1) => make_branch![b0, m1, b1],
+
+            // Tree height shrinks (due to merge).
+            //
+            Merge(orphan) => match orphan {
+                Items(vals) => Leaf { vals },
+                Child(branch) => branch,
+            },
+        };
     }
 
     fn to_vec(&self) -> Vec<i32> {
