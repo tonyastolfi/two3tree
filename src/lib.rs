@@ -196,17 +196,9 @@ impl Subtree {
     fn update(self, config: &TreeConfig, batch: Vec<Update>) -> UpdateResult {
         assert!(batch.len() <= config.batch_size);
 
-        use Node::{Binary, Ternary};
-        use Orphan::{Child, Items};
-        use Subtree::{Branch, Leaf};
-        use UpdateResult::{Done, Merge, Split};
-
         match self {
-            Leaf { vals } => update_leaf(config, batch, vals),
-            Branch(mut branch) => match &*branch {
-                Node::Binary { .. } => update_binary_node(config, branch, batch),
-                Node::Ternary { .. } => update_ternary_node(config, branch, batch),
-            },
+            Subtree::Leaf { vals } => update_leaf(config, batch, vals),
+            Subtree::Branch(mut branch) => update_node(config, branch, batch),
         }
     }
 }
@@ -242,7 +234,7 @@ pub fn update_leaf(config: &TreeConfig, batch: Vec<Update>, vals: Vec<i32>) -> U
     return Split(Leaf { vals: merged }, split_min, Leaf { vals: split_vals });
 }
 
-enum NodeBuilderState {
+enum NodeBuilder {
     Empty,
     MergeLeft(Orphan),
     Branch1(Subtree),
@@ -274,12 +266,13 @@ enum NodeBuilderState {
         Subtree,
     ),
 }
-impl NodeBuilderState {
+
+impl NodeBuilder {
     fn new() -> Self {
         Self::Empty
     }
     fn update_first(&mut self, first: UpdateResult) {
-        use NodeBuilderState::*;
+        use NodeBuilder::*;
         use UpdateResult::*;
 
         match (std::mem::replace(self, Empty), first) {
@@ -296,7 +289,7 @@ impl NodeBuilderState {
         }
     }
     fn update_next(&mut self, config: &TreeConfig, next_min: i32, next: UpdateResult) {
-        use NodeBuilderState::*;
+        use NodeBuilder::*;
         use UpdateResult::*;
 
         match (std::mem::replace(self, Empty), next_min, next) {
@@ -377,40 +370,12 @@ impl NodeBuilderState {
     }
 }
 
-enum NodeBuilderBuffer {
-    Empty,
-    FirstBranch(Subtree),
-    NextBranch(i32, Subtree),
-    FirstOrphan(Orphan),
-    NextOrphan(i32, Orphan),
-}
-
-struct NodeBuilder {
-    state: NodeBuilderState,
-    buffer: NodeBuilderBuffer,
-}
-
-impl NodeBuilder {
-    /*
-    fn build(self) -> UpdateResult {
-        use NodeBuilderBuffer::*;
-        use NodeBuilderState::*;
-        use UpdateResult::*;
-
-        match (self.state, self.buffer) {
-            (Branch1(b0), NextBranch(m1, b1)) => Done(make_branch![b0, m1, b1]),
-            (Branch2(b0, m1, b1), NextBranch(
-        }
-    }*/
-}
-
-pub fn update_binary_node(
-    config: &TreeConfig,
-    mut branch: Box<Node>,
-    batch: Vec<Update>,
-) -> UpdateResult {
+pub fn update_node(config: &TreeConfig, mut branch: Box<Node>, batch: Vec<Update>) -> UpdateResult {
+    use NodeBuilder::*;
     use Orphan::Child;
     use UpdateResult::{Done, Merge, Split};
+
+    let mut builder = NodeBuilder::new();
 
     if let Node::Binary {
         left,
@@ -426,96 +391,9 @@ pub fn update_binary_node(
             .into_iter()
             .partition(|update| update.key() < &right_min);
 
-        return match left.update(config, left_batch) {
-            Done(left) => match right.update(config, right_batch) {
-                Done(right) => update_branch!(branch, left, right_min, right),
-                Split(right, right_split_min, right_split) => {
-                    update_branch!(branch, left, right_min, right, right_split_min, right_split)
-                }
-                Merge(right_orphan) => match left.merge_right(config, right_min, right_orphan) {
-                    MergeResult::Done(left) => update_branch!(branch, left),
-                    MergeResult::Split(left, split_min, split) => {
-                        update_branch!(branch, left, split_min, split)
-                    }
-                },
-            },
-            Split(left, left_split1_min, mut left_split1) => {
-                match right.update(config, right_batch) {
-                    Done(right) => {
-                        update_branch!(branch, left, left_split1_min, left_split1, right_min, right)
-                    }
-                    Split(right, right_split_min, right_split) => update_branch!(
-                        branch,
-                        left,
-                        left_split1_min,
-                        left_split1,
-                        right_min,
-                        right,
-                        right_split_min,
-                        right_split
-                    ),
-                    Merge(right_orphan) => {
-                        match left_split1.merge_right(config, right_min, right_orphan) {
-                            MergeResult::Done(left_split1) => {
-                                update_branch!(branch, left, left_split1_min, left_split1)
-                            }
-                            MergeResult::Split(left_split1, left_split2_min, left_split2) => {
-                                update_branch!(
-                                    branch,
-                                    left,
-                                    left_split1_min,
-                                    left_split1,
-                                    left_split2_min,
-                                    left_split2
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-            Merge(left_orphan) => match right.update(config, right_batch) {
-                Done(right) => match right.merge_left(config, left_orphan, right_min) {
-                    MergeResult::Done(right) => update_branch!(branch, right),
-                    MergeResult::Split(right, right_split_min, right_split) => {
-                        update_branch!(branch, right, right_split_min, right_split)
-                    }
-                },
-                Split(right, right_split_min, right_split) => {
-                    update_branch!(branch, right, right_split_min, right_split)
-                }
-                Merge(right_orphan) => {
-                    update_branch!(branch, fuse2(config, left_orphan, right_min, right_orphan))
-                }
-            },
-        };
-    } else {
-        panic!("Not a binary node!");
-    }
-}
-
-/*
-update_subtree!
-
-([finalized...], (child0, batch0), (child1, batch1), ...) => {
-
-match child0 {
-    Done(child0) => {}
-    Split(child0, child0_split_min, child0_split) => {}
-    Merge(orphan0) => {}
-}
-}
-
-*/
-
-pub fn update_ternary_node(
-    config: &TreeConfig,
-    mut branch: Box<Node>,
-    batch: Vec<Update>,
-) -> UpdateResult {
-    use Orphan::Child;
-    use UpdateResult::{Done, Merge, Split};
-
-    if let Node::Ternary {
+        builder.update_first(left.update(config, left_batch));
+        builder.update_next(config, right_min, right.update(config, right_batch));
+    } else if let Node::Ternary {
         left,
         middle_min,
         middle,
@@ -535,519 +413,24 @@ pub fn update_ternary_node(
             .into_iter()
             .partition(|update| update.key() < &right_min);
 
-        match left.update(config, left_batch) {
-            Done(left) => match middle.update(config, middle_batch) {
-                Done(middle) => match right.update(config, right_batch) {
-                    Done(right) => {
-                        update_branch!(branch, left, middle_min, middle, right_min, right)
-                    }
-                    Split(right, right_split1_min, right_split1) => update_branch!(
-                        branch,
-                        left,
-                        middle_min,
-                        middle,
-                        right_min,
-                        right,
-                        right_split1_min,
-                        right_split1
-                    ),
-                    Merge(right_orphan) => {
-                        match middle.merge_right(config, right_min, right_orphan) {
-                            MergeResult::Done(middle) => {
-                                update_branch!(branch, left, middle_min, middle)
-                            }
-                            MergeResult::Split(middle, middle_split0_min, middle_split0) => {
-                                update_branch!(
-                                    branch,
-                                    left,
-                                    middle_min,
-                                    middle,
-                                    middle_split0_min,
-                                    middle_split0
-                                )
-                            }
-                        }
-                    }
-                },
-                Split(middle, middle_split1_min, middle_split1) => {
-                    match right.update(config, right_batch) {
-                        Done(right) => update_branch!(
-                            branch,
-                            left,
-                            middle_min,
-                            middle,
-                            middle_split1_min,
-                            middle_split1,
-                            right_min,
-                            right
-                        ),
-                        Split(right, right_split1_min, right_split1) => update_branch!(
-                            branch,
-                            left,
-                            middle_min,
-                            middle,
-                            middle_split1_min,
-                            middle_split1,
-                            right_min,
-                            right,
-                            right_split1_min,
-                            right_split1
-                        ),
-                        Merge(right_orphan) => {
-                            match middle_split1.merge_right(config, right_min, right_orphan) {
-                                MergeResult::Done(middle_split1) => update_branch!(
-                                    branch,
-                                    left,
-                                    middle_min,
-                                    middle,
-                                    middle_split1_min,
-                                    middle_split1
-                                ),
-                                MergeResult::Split(
-                                    middle_split1,
-                                    middle_split2_min,
-                                    middle_split2,
-                                ) => update_branch!(
-                                    branch,
-                                    left,
-                                    middle_min,
-                                    middle,
-                                    middle_split1_min,
-                                    middle_split1,
-                                    middle_split2_min,
-                                    middle_split2
-                                ),
-                            }
-                        }
-                    }
-                }
-                Merge(middle_orphan) => match right.update(config, right_batch) {
-                    Done(right) => match right.merge_left(config, middle_orphan, right_min) {
-                        MergeResult::Done(right) => update_branch!(branch, left, right_min, right),
-                        MergeResult::Split(right, right_split_min, right_split) => update_branch!(
-                            branch,
-                            left,
-                            right_min,
-                            right,
-                            right_split_min,
-                            right_split
-                        ),
-                    },
-                    Split(right, right_split_min, right_split) => {
-                        match left.merge_right(config, middle_min, middle_orphan) {
-                            MergeResult::Done(left) => update_branch!(
-                                branch,
-                                left,
-                                right_min,
-                                right,
-                                right_split_min,
-                                right_split
-                            ),
-                            MergeResult::Split(left, left_split_min, left_split) => update_branch!(
-                                branch,
-                                left,
-                                left_split_min,
-                                left_split,
-                                right_min,
-                                right,
-                                right_split_min,
-                                right_split
-                            ),
-                        }
-                    }
-                    Merge(right_orphan) => update_branch!(
-                        branch,
-                        left,
-                        middle_min,
-                        fuse2(config, middle_orphan, right_min, right_orphan)
-                    ),
-                },
-            },
-            Split(left, left_split_min, left_split) => match middle.update(config, middle_batch) {
-                Done(middle) => match right.update(config, right_batch) {
-                    Done(right) => update_branch!(
-                        branch,
-                        left,
-                        left_split_min,
-                        left_split,
-                        middle_min,
-                        middle,
-                        right_min,
-                        right
-                    ),
-                    Split(right, right_split_min, right_split) => update_branch!(
-                        branch,
-                        left,
-                        left_split_min,
-                        left_split,
-                        middle_min,
-                        middle,
-                        right_min,
-                        right,
-                        right_split_min,
-                        right_split
-                    ),
-                    Merge(right_orphan) => {
-                        match middle.merge_right(config, right_min, right_orphan) {
-                            MergeResult::Done(middle) => update_branch!(
-                                branch,
-                                left,
-                                left_split_min,
-                                left_split,
-                                middle_min,
-                                middle
-                            ),
-                            MergeResult::Split(middle, middle_split_min, middle_split) => {
-                                update_branch!(
-                                    branch,
-                                    left,
-                                    left_split_min,
-                                    left_split,
-                                    middle_min,
-                                    middle,
-                                    middle_split_min,
-                                    middle_split
-                                )
-                            }
-                        }
-                    }
-                },
-                Split(middle, middle_split1_min, middle_split1) => {
-                    match right.update(config, right_batch) {
-                        Done(right) => update_branch!(
-                            branch,
-                            left,
-                            left_split_min,
-                            left_split,
-                            middle_min,
-                            middle,
-                            middle_split1_min,
-                            middle_split1,
-                            right_min,
-                            right
-                        ),
-                        Split(right, right_split_min, right_split) => update_branch!(
-                            branch,
-                            left,
-                            left_split_min,
-                            left_split,
-                            middle_min,
-                            middle,
-                            middle_split1_min,
-                            middle_split1,
-                            right_min,
-                            right,
-                            right_split_min,
-                            right_split
-                        ),
-                        Merge(right_orphan) => {
-                            match middle_split1.merge_right(config, right_min, right_orphan) {
-                                MergeResult::Done(middle_split1) => update_branch!(
-                                    branch,
-                                    left,
-                                    left_split_min,
-                                    left_split,
-                                    middle_min,
-                                    middle,
-                                    middle_split1_min,
-                                    middle_split1
-                                ),
-                                MergeResult::Split(
-                                    middle_split1,
-                                    middle_split2_min,
-                                    middle_split2,
-                                ) => update_branch!(
-                                    branch,
-                                    left,
-                                    left_split_min,
-                                    left_split,
-                                    middle_min,
-                                    middle,
-                                    middle_split1_min,
-                                    middle_split1,
-                                    middle_split2_min,
-                                    middle_split2
-                                ),
-                            }
-                        }
-                    }
-                }
-                Merge(middle_orphan) => match right.update(config, right_batch) {
-                    Done(right) => match right.merge_left(config, middle_orphan, right_min) {
-                        MergeResult::Done(right) => update_branch!(
-                            branch,
-                            left,
-                            left_split_min,
-                            left_split,
-                            right_min,
-                            right
-                        ),
-                        MergeResult::Split(right, right_split_min, right_split) => update_branch!(
-                            branch,
-                            left,
-                            left_split_min,
-                            left_split,
-                            right_min,
-                            right,
-                            right_split_min,
-                            right_split
-                        ),
-                    },
-                    Split(right, right_split1_min, right_split1) => {
-                        match right.merge_left(config, middle_orphan, right_min) {
-                            MergeResult::Done(right) => update_branch!(
-                                branch,
-                                left,
-                                left_split_min,
-                                left_split,
-                                right_min,
-                                right,
-                                right_split1_min,
-                                right_split1
-                            ),
-                            MergeResult::Split(right, right_split0_min, right_split0) => {
-                                update_branch!(
-                                    branch,
-                                    left,
-                                    left_split_min,
-                                    left_split,
-                                    right_min,
-                                    right,
-                                    right_split0_min,
-                                    right_split0,
-                                    right_split1_min,
-                                    right_split1
-                                )
-                            }
-                        }
-                    }
-                    Merge(right_orphan) => update_branch!(
-                        branch,
-                        left,
-                        left_split_min,
-                        left_split,
-                        middle_min,
-                        fuse2(config, middle_orphan, right_min, right_orphan)
-                    ),
-                },
-            },
-            Merge(left_orphan) => match middle.update(config, middle_batch) {
-                Done(middle) => match right.update(config, right_batch) {
-                    Done(right) => match middle.merge_left(config, left_orphan, middle_min) {
-                        MergeResult::Done(middle) => {
-                            update_branch!(branch, middle, right_min, right)
-                        }
-                        MergeResult::Split(middle, middle_split_min, middle_split) => {
-                            update_branch!(
-                                branch,
-                                middle,
-                                middle_split_min,
-                                middle_split,
-                                right_min,
-                                right
-                            )
-                        }
-                    },
-                    Split(right, right_split_min, right_split) => {
-                        match middle.merge_left(config, left_orphan, middle_min) {
-                            MergeResult::Done(middle) => update_branch!(
-                                branch,
-                                middle,
-                                right_min,
-                                right,
-                                right_split_min,
-                                right_split
-                            ),
-                            MergeResult::Split(middle, middle_split_min, middle_split) => {
-                                update_branch!(
-                                    branch,
-                                    middle,
-                                    middle_split_min,
-                                    middle_split,
-                                    right_min,
-                                    right,
-                                    right_split_min,
-                                    right_split
-                                )
-                            }
-                        }
-                    }
-                    Merge(right_orphan) => match middle.merge_left(config, left_orphan, middle_min)
-                    {
-                        MergeResult::Done(middle) => {
-                            match middle.merge_right(config, right_min, right_orphan) {
-                                MergeResult::Done(middle) => {
-                                    // TODO - is this even possible?
-                                    update_branch!(branch, middle)
-                                }
-                                MergeResult::Split(middle, middle_split_min, middle_split) => {
-                                    update_branch!(branch, middle, middle_split_min, middle_split)
-                                }
-                            }
-                        }
-                        MergeResult::Split(middle, middle_split1_min, middle_split1) => {
-                            match middle_split1.merge_right(config, right_min, right_orphan) {
-                                MergeResult::Done(middle_split1) => {
-                                    update_branch!(branch, middle, middle_split1_min, middle_split1)
-                                }
-                                MergeResult::Split(
-                                    middle_split1,
-                                    middle_split2_min,
-                                    middle_split2,
-                                ) => update_branch!(
-                                    branch,
-                                    middle,
-                                    middle_split1_min,
-                                    middle_split1,
-                                    middle_split2_min,
-                                    middle_split2
-                                ),
-                            }
-                        }
-                    },
-                },
-                Split(middle, middle_split1_min, middle_split1) => {
-                    match right.update(config, right_batch) {
-                        Done(right) => match middle.merge_left(config, left_orphan, middle_min) {
-                            MergeResult::Done(middle) => update_branch!(
-                                branch,
-                                middle,
-                                middle_split1_min,
-                                middle_split1,
-                                right_min,
-                                right
-                            ),
-                            MergeResult::Split(middle, middle_split0_min, middle_split0) => {
-                                update_branch!(
-                                    branch,
-                                    middle,
-                                    middle_split0_min,
-                                    middle_split0,
-                                    middle_split1_min,
-                                    middle_split1,
-                                    right_min,
-                                    right
-                                )
-                            }
-                        },
-                        Split(right, right_split_min, right_split) => {
-                            match middle.merge_left(config, left_orphan, middle_min) {
-                                MergeResult::Done(middle) => update_branch!(
-                                    branch,
-                                    middle,
-                                    middle_split1_min,
-                                    middle_split1,
-                                    right_min,
-                                    right,
-                                    right_split_min,
-                                    right_split
-                                ),
-                                MergeResult::Split(middle, middle_split0_min, middle_split0) => {
-                                    update_branch!(
-                                        branch,
-                                        middle,
-                                        middle_split0_min,
-                                        middle_split0,
-                                        middle_split1_min,
-                                        middle_split1,
-                                        right_min,
-                                        right,
-                                        right_split_min,
-                                        right_split
-                                    )
-                                }
-                            }
-                        }
-                        Merge(right_orphan) => {
-                            match middle.merge_left(config, left_orphan, middle_min) {
-                                MergeResult::Done(middle) => {
-                                    match middle_split1.merge_right(config, right_min, right_orphan)
-                                    {
-                                        MergeResult::Done(middle_split1) => update_branch!(
-                                            branch,
-                                            middle,
-                                            middle_split1_min,
-                                            middle_split1
-                                        ),
-                                        MergeResult::Split(
-                                            middle_split1,
-                                            middle_split2_min,
-                                            middle_split2,
-                                        ) => update_branch!(
-                                            branch,
-                                            middle,
-                                            middle_split1_min,
-                                            middle_split1,
-                                            middle_split2_min,
-                                            middle_split2
-                                        ),
-                                    }
-                                }
-                                MergeResult::Split(middle, middle_split0_min, middle_split0) => {
-                                    match middle_split1.merge_right(config, right_min, right_orphan)
-                                    {
-                                        MergeResult::Done(middle_split1) => update_branch!(
-                                            branch,
-                                            middle,
-                                            middle_split0_min,
-                                            middle_split0,
-                                            middle_split1_min,
-                                            middle_split1
-                                        ),
-                                        MergeResult::Split(
-                                            middle_split1,
-                                            middle_split2_min,
-                                            middle_split2,
-                                        ) => update_branch!(
-                                            branch,
-                                            middle,
-                                            middle_split0_min,
-                                            middle_split0,
-                                            middle_split1_min,
-                                            middle_split1,
-                                            middle_split2_min,
-                                            middle_split2
-                                        ),
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Merge(middle_orphan) => match right.update(config, right_batch) {
-                    Done(right) => update_branch!(
-                        branch,
-                        fuse2(config, left_orphan, middle_min, middle_orphan),
-                        right_min,
-                        right
-                    ),
-                    Split(right, right_split_min, right_split) => update_branch!(
-                        branch,
-                        fuse2(config, left_orphan, middle_min, middle_orphan),
-                        right_min,
-                        right,
-                        right_split_min,
-                        right_split
-                    ),
-                    Merge(right_orphan) => match fuse3(
-                        config,
-                        left_orphan,
-                        middle_min,
-                        middle_orphan,
-                        right_min,
-                        right_orphan,
-                    ) {
-                        MergeResult::Done(fused_orphan) => update_branch!(branch, fused_orphan),
-                        MergeResult::Split(fused_left, fused_right_min, fused_right) => {
-                            update_branch!(branch, fused_left, fused_right_min, fused_right)
-                        }
-                    },
-                },
-            },
-        }
-    } else {
-        panic!("Not a ternary node!");
+        builder.update_first(left.update(config, left_batch));
+        builder.update_next(config, middle_min, middle.update(config, middle_batch));
+        builder.update_next(config, right_min, right.update(config, right_batch));
     }
+
+    return match builder {
+        Branch1(b0) => update_branch!(branch, b0),
+        Branch2(b0, m1, b1) => update_branch!(branch, b0, m1, b1),
+        Branch3(b0, m1, b1, m2, b2) => update_branch!(branch, b0, m1, b1, m2, b2),
+        Branch4(b0, m1, b1, m2, b2, m3, b3) => update_branch!(branch, b0, m1, b1, m2, b2, m3, b3),
+        Branch5(b0, m1, b1, m2, b2, m3, b3, m4, b4) => {
+            update_branch!(branch, b0, m1, b1, m2, b2, m3, b3, m4, b4)
+        }
+        Branch6(b0, m1, b1, m2, b2, m3, b3, m4, b4, m5, b5) => {
+            update_branch!(branch, b0, m1, b1, m2, b2, m3, b3, m4, b4, m5, b5)
+        }
+        _ => panic!("update error!"),
+    };
 }
 
 /*
