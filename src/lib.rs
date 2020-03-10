@@ -31,6 +31,21 @@ pub trait Viable {
     fn is_viable(&self, config: &TreeConfig) -> bool;
 }
 
+fn lower_bound_by_key<'a, B, F, T: 'a, V: std::ops::Deref<Target = [T]>>(
+    v: &'a V,
+    b: &B,
+    f: F,
+) -> usize
+where
+    B: Ord,
+    F: FnMut(&'a T) -> B,
+{
+    match v.binary_search_by_key(b, f) {
+        Result::Ok(i) => i,
+        Result::Err(i) => i,
+    }
+}
+
 #[derive(Debug)]
 pub enum Node {
     Binary {
@@ -86,6 +101,70 @@ impl Height for Node {
 impl Viable for Node {
     fn is_viable(&self, _: &TreeConfig) -> bool {
         true
+    }
+}
+
+#[derive(Debug)]
+pub struct BufferNode {
+    // The invariant between `queue` and `node`:
+    //
+    // v = {left, right_min, right}
+    // q {leftCount <= B, rightCount <= B}
+    //
+    // v = {left, middle_min, middle, right_min, right}
+    // q {leftCount + middleCount <= B, middleCount + rightCount <= B}
+    //   leftCount + 2*middleCount + rightCount <= 2*B
+    //
+    // This puts an upper bound of (2*B, 3*B) on the size of `queue`.  It also means we
+    // flush to at most 2/3 of the `Subtree`s of a node when we overflow.
+    //
+    // We must always flush exactly `B` updates to maximize efficiency.  This
+    // means we can tighten the bound on the size of `queue` to:
+    //    - 1*B for binary nodes
+    //    - 2*B for ternary nodes
+    //
+    // Proof by induction:
+    //  0 (base) empty queue on v (\nu):
+    //           if b contains B updates for any subtree of v, just pass through.
+    //           otherwise v.queue = b.  b can not contain >=B updates for more than
+    //           one subtree since it only contains B updates overall.  Else case 1.
+    //
+    //  1b (q = {leftCount <= B, rightCount <= B},
+    //      q.len == B):
+    //           (q' = q + b).len == 2*B; there must be some batch b' addressed exclusively
+    //            to one of the two subtrees.  Flush it, and we are back down to q'.len == B,
+    //            with or without a split.  In other words, back to case 1.
+    //
+    //  1t (q = {leftCount <= B, middleCount <= B, rightCount <= B},
+    //      q.len == B):
+    //           (q' = q + b).len == 2*B.  There may or may not be a batch b' (b'.len == B)
+    //            addressed exclusively to one of the three subtrees.  If there is, then
+    //            flush it, bringing (q'' = q' - b').len == B, we are back to case 1.
+    //            If there are two such batches, flush both, back to case 0.  There can't be 3
+    //            since the total q'.len == 2*B.  Else, case 2.
+    //
+    //  2 (q = {leftCount <= B, middleCount <= B, rightCount <= B},
+    //     q.len == 2*B):
+    //           (q' = q + b).len == 3*B.  There may be 2 or 3 batches ready to flush, but
+    //           there can't be more.  If there are 3 batches, then it must be the case that
+    //           all the counts are exactly B (proof by contradiction: suppose otherwise; then
+    //           q'.len must be > 3*B, contradicting the fact that q'.len == 3*B).  Flush
+    //           two out of the three of these.  q''.len == 1*B post-flush; we are back to
+    //           case 1.
+    //
+    queue: Vec<Update>,
+    node: Node,
+}
+
+impl Height for BufferNode {
+    fn height(&self) -> u16 {
+        self.node.height()
+    }
+}
+
+impl Viable for BufferNode {
+    fn is_viable(&self, config: &TreeConfig) -> bool {
+        self.node.is_viable(config)
     }
 }
 
@@ -164,9 +243,18 @@ macro_rules! make_node {
     };
 }
 
+macro_rules! make_buffer_node {
+    [$queue:expr, $($x:expr),*] => {
+        BufferNode {
+            queue: $queue,
+            node: make_node![$($x),*],
+        }
+    }
+ }
+
 macro_rules! make_branch {
     [$($x:expr),*] => {
-        Subtree::Branch(Box::new(make_node![$($x),*]))
+        Subtree::Branch(Box::new(make_buffer_node![$($x),*]))
     };
 }
 
@@ -199,7 +287,7 @@ pub fn fuse_orphans(config: &TreeConfig, left: Orphan, right_min: i32, right: Or
             }
         }
         (Child(left_subtree), Child(right_subtree)) => {
-            make_branch![left_subtree, right_min, right_subtree]
+            make_branch![Vec::new(), left_subtree, right_min, right_subtree]
         }
         _ => {
             panic!("fuse must be called on like items.");
@@ -207,11 +295,17 @@ pub fn fuse_orphans(config: &TreeConfig, left: Orphan, right_min: i32, right: Or
     }
 }
 
+pub fn split_queue(mut queue: Vec<Update>, m: &i32) -> (Vec<Update>, Vec<Update>) {
+    let ind = lower_bound_by_key(&queue, m, |update| *update.key());
+    let split: Vec<Update> = queue.drain(ind..).collect();
+    (queue, split)
+}
+
 //--------------------------------------------------------
 #[derive(Debug)]
 pub enum Subtree {
     Leaf { vals: Vec<i32> },
-    Branch(Box<Node>),
+    Branch(Box<BufferNode>),
 }
 
 impl Height for Subtree {
@@ -253,22 +347,30 @@ impl Subtree {
                 dst.extend(vals);
             }
             Branch(ref branch) => match &**branch {
-                Node::Binary {
-                    height: _,
-                    left,
-                    right_min,
-                    right,
+                BufferNode {
+                    queue: _,
+                    node:
+                        Node::Binary {
+                            height: _,
+                            left,
+                            right_min,
+                            right,
+                        },
                 } => {
                     left.to_vec(dst);
                     right.to_vec(dst);
                 }
-                Node::Ternary {
-                    height: _,
-                    left,
-                    middle_min,
-                    middle,
-                    right_min,
-                    right,
+                BufferNode {
+                    queue: _,
+                    node:
+                        Node::Ternary {
+                            height: _,
+                            left,
+                            middle_min,
+                            middle,
+                            right_min,
+                            right,
+                        },
                 } => {
                     left.to_vec(dst);
                     middle.to_vec(dst);
@@ -287,11 +389,15 @@ impl Subtree {
                 Err(_) => None,
             },
             Branch(ref branch) => match &**branch {
-                Node::Binary {
-                    height: _,
-                    left,
-                    right_min,
-                    right,
+                BufferNode {
+                    queue: _,
+                    node:
+                        Node::Binary {
+                            height: _,
+                            left,
+                            right_min,
+                            right,
+                        },
                 } => {
                     if key < right_min {
                         left.find(key)
@@ -299,13 +405,17 @@ impl Subtree {
                         right.find(key)
                     }
                 }
-                Node::Ternary {
-                    height: _,
-                    left,
-                    middle_min,
-                    middle,
-                    right_min,
-                    right,
+                BufferNode {
+                    queue: _,
+                    node:
+                        Node::Ternary {
+                            height: _,
+                            left,
+                            middle_min,
+                            middle,
+                            right_min,
+                            right,
+                        },
                 } => {
                     if key < middle_min {
                         left.find(key)
@@ -332,32 +442,45 @@ impl Subtree {
                 (
                     b0,
                     m1,
-                    Node::Binary {
-                        height: _,
-                        left: b1,
-                        right_min: m2,
-                        right: b2,
+                    BufferNode {
+                        queue,
+                        node:
+                            Node::Binary {
+                                height: _,
+                                left: b1,
+                                right_min: m2,
+                                right: b2,
+                            },
                     },
                 ) => {
                     assert!(m1 < m2);
-                    *branch = make_node![b0, m1, b1, m2, b2];
+                    *branch = make_buffer_node![queue, b0, m1, b1, m2, b2];
                     Done(Branch(branch))
                 }
                 (
                     b0,
                     m1,
-                    Node::Ternary {
-                        height: _,
-                        left: b1,
-                        middle_min: m2,
-                        middle: b2,
-                        right_min: m3,
-                        right: b3,
+                    BufferNode {
+                        queue,
+                        node:
+                            Node::Ternary {
+                                height: _,
+                                left: b1,
+                                middle_min: m2,
+                                middle: b2,
+                                right_min: m3,
+                                right: b3,
+                            },
                     },
                 ) => {
                     assert!(m1 < m2);
-                    *branch = make_node![b0, m1, b1];
-                    Split(Branch(branch), m2, make_branch![b2, m3, b3])
+
+                    let (left_queue, right_queue) = split_queue(queue, &m2);
+                    assert!(left_queue.len() <= config.batch_size);
+                    assert!(right_queue.len() <= config.batch_size);
+
+                    *branch = make_buffer_node![left_queue, b0, m1, b1];
+                    Split(Branch(branch), m2, make_branch![right_queue, b2, m3, b3])
                 }
             },
             _ => panic!("illegal merge"),
@@ -375,34 +498,47 @@ impl Subtree {
             }
             (Branch(mut branch), child_min, Child(child)) => match (*branch, child_min, child) {
                 (
-                    Node::Binary {
-                        height: _,
-                        left: b0,
-                        right_min: m1,
-                        right: b1,
+                    BufferNode {
+                        queue,
+                        node:
+                            Node::Binary {
+                                height: _,
+                                left: b0,
+                                right_min: m1,
+                                right: b1,
+                            },
                     },
                     m2,
                     b2,
                 ) => {
                     assert!(m1 < m2, "m1={}, m2={}", m1, m2);
-                    *branch = make_node![b0, m1, b1, m2, b2];
+                    *branch = make_buffer_node![queue, b0, m1, b1, m2, b2];
                     Done(Branch(branch))
                 }
                 (
-                    Node::Ternary {
-                        height: _,
-                        left: b0,
-                        middle_min: m1,
-                        middle: b1,
-                        right_min: m2,
-                        right: b2,
+                    BufferNode {
+                        queue,
+                        node:
+                            Node::Ternary {
+                                height: _,
+                                left: b0,
+                                middle_min: m1,
+                                middle: b1,
+                                right_min: m2,
+                                right: b2,
+                            },
                     },
                     m3,
                     b3,
                 ) => {
                     assert!(m2 < m3, "m2={}, m3={}", m2, m3);
-                    *branch = make_node![b0, m1, b1];
-                    Split(Branch(branch), m2, make_branch![b2, m3, b3])
+
+                    let (left_queue, right_queue) = split_queue(queue, &m2);
+                    assert!(left_queue.len() <= config.batch_size);
+                    assert!(right_queue.len() <= config.batch_size);
+
+                    *branch = make_buffer_node![left_queue, b0, m1, b1];
+                    Split(Branch(branch), m2, make_branch![right_queue, b2, m3, b3])
                 }
             },
             _ => panic!("illegal merge"),
@@ -570,7 +706,11 @@ impl NodeBuilder {
     }
 }
 
-pub fn update_node(config: &TreeConfig, mut branch: Box<Node>, batch: Vec<Update>) -> UpdateResult {
+pub fn update_node(
+    config: &TreeConfig,
+    mut branch: Box<BufferNode>,
+    batch: Vec<Update>,
+) -> UpdateResult {
     use NodeBuilder::*;
     use Orphan::Child;
     use Subtree::Branch;
@@ -580,15 +720,35 @@ pub fn update_node(config: &TreeConfig, mut branch: Box<Node>, batch: Vec<Update
         return Done(Subtree::Branch(branch));
     }
 
+    let BufferNode { queue, node } = *branch;
+
+    use itertools::EitherOrBoth::{Both, Left, Right};
+
+    let updates: Vec<Update> = queue
+        .into_iter()
+        .merge_join_by(batch.into_iter(), |a, b| a.key().cmp(b.key()))
+        .map(|either| match either {
+            Left(update) => update,
+            Right(update) => update,
+            Both(_, latest) => latest,
+        })
+        .collect();
+
     let builder = {
         if let Node::Binary {
             height: _,
             left,
             right_min,
             right,
-        } = *branch
+        } = node
         {
-            let (left_batch, right_batch): (Vec<Update>, Vec<Update>) = batch
+            // TODO:
+            //  merge `batch` and `queue`.
+            //  if the result is >= batch_size, then split the merged queue
+            //    and send `batch_size` updates to _either_ `left` or `right`.
+            let right_batch_min = lower_bound_by_key(&updates, &right_min, |update| *update.key());
+
+            let (left_batch, right_batch): (Vec<Update>, Vec<Update>) = updates
                 .into_iter()
                 .partition(|update| update.key() < &right_min);
 
@@ -604,9 +764,16 @@ pub fn update_node(config: &TreeConfig, mut branch: Box<Node>, batch: Vec<Update
             middle,
             right_min,
             right,
-        } = *branch
+        } = node
         {
-            let (left_batch, non_left_batch): (Vec<Update>, Vec<Update>) = batch
+            let middle_batch_min =
+                lower_bound_by_key(&updates, &middle_min, |update| *update.key());
+            let right_batch_min =
+                lower_bound_by_key(&&updates[middle_batch_min..], &right_min, |update| {
+                    *update.key()
+                });
+
+            let (left_batch, non_left_batch): (Vec<Update>, Vec<Update>) = updates
                 .into_iter()
                 .partition(|update| update.key() < &middle_min);
 
@@ -618,17 +785,31 @@ pub fn update_node(config: &TreeConfig, mut branch: Box<Node>, batch: Vec<Update
                 .update(config, middle_min, middle.update(config, middle_batch))
                 .update(config, right_min, right.update(config, right_batch))
         } else {
-            panic!("update_node called on non-node: {:?}", branch);
+            panic!("update_node called on non-node: {:?}", node);
         }
     };
 
     return match builder {
-        Branch1(b0) => Merge(Child(b0)),
+        Branch1(b0) =>
+        //
+        // TODO - Before we return in this case, send any remaining queued updates down to `b0`.
+        //   This is needed because there is no affordance for bubbling unflushed queued updates
+        //   on a merge, which in turn is because the merge operations must be O(1) to achieve
+        //   our overall algorithmic complexity aim.  It is safe/correct to do this because:
+        //     1. Any remaining `queue` updates must be <= batch_size in number.  This is because
+        //        we can only trigger a merge if the node was binary when `update_node` was called.
+        //        (TODO: it would be great to hint/guarantee this more strongly using types)
+        //     2. If we are down to one child branch at this point, then by definition its bounding
+        //        key range has expanded to fill the entire range of its parent; there is no other
+        //        Subtree that can 'claim' ownership of the key range of the defunct sibling of `b0`.
+        {
+            Merge(Child(b0))
+        }
         Branch2(b0, m1, b1) => {
             assert!(b0.is_viable(config));
             assert!(b1.is_viable(config));
 
-            *branch = make_node![b0, m1, b1];
+            *branch = make_buffer_node![Vec::new(), b0, m1, b1];
             Done(Branch(branch))
         }
         Branch3(b0, m1, b1, m2, b2) => {
@@ -636,7 +817,7 @@ pub fn update_node(config: &TreeConfig, mut branch: Box<Node>, batch: Vec<Update
             assert!(b1.is_viable(config));
             assert!(b2.is_viable(config));
 
-            *branch = make_node![b0, m1, b1, m2, b2];
+            *branch = make_buffer_node![Vec::new(), b0, m1, b1, m2, b2];
             Done(Branch(branch))
         }
         Branch4(b0, m1, b1, m2, b2, m3, b3) => {
@@ -645,8 +826,8 @@ pub fn update_node(config: &TreeConfig, mut branch: Box<Node>, batch: Vec<Update
             assert!(b2.is_viable(config));
             assert!(b3.is_viable(config));
 
-            *branch = make_node![b0, m1, b1];
-            split![branch, m2, b2, m3, b3]
+            *branch = make_buffer_node![Vec::new(), b0, m1, b1];
+            split![branch, m2, Vec::new(), b2, m3, b3]
         }
         Branch5(b0, m1, b1, m2, b2, m3, b3, m4, b4) => {
             assert!(b0.is_viable(config));
@@ -655,8 +836,8 @@ pub fn update_node(config: &TreeConfig, mut branch: Box<Node>, batch: Vec<Update
             assert!(b3.is_viable(config));
             assert!(b4.is_viable(config));
 
-            *branch = make_node![b0, m1, b1, m2, b2];
-            split![branch, m3, b3, m4, b4]
+            *branch = make_buffer_node![Vec::new(), b0, m1, b1, m2, b2];
+            split![branch, m3, Vec::new(), b3, m4, b4]
         }
         Branch6(b0, m1, b1, m2, b2, m3, b3, m4, b4, m5, b5) => {
             assert!(b0.is_viable(config));
@@ -666,8 +847,8 @@ pub fn update_node(config: &TreeConfig, mut branch: Box<Node>, batch: Vec<Update
             assert!(b4.is_viable(config));
             assert!(b5.is_viable(config));
 
-            *branch = make_node![b0, m1, b1, m2, b2];
-            split![branch, m3, b3, m4, b4, m5, b5]
+            *branch = make_buffer_node![Vec::new(), b0, m1, b1, m2, b2];
+            split![branch, m3, Vec::new(), b3, m4, b4, m5, b5]
         }
         _ => panic!("update error! builder={:?}", builder),
     };
@@ -708,7 +889,7 @@ impl Tree {
 
             // Tree height grows (due to split).
             //
-            Split(b0, m1, b1) => make_branch![b0, m1, b1],
+            Split(b0, m1, b1) => make_branch![Vec::new(), b0, m1, b1],
 
             // Tree height shrinks (due to merge).
             //
@@ -804,7 +985,7 @@ mod tests {
         use rand::prelude::*;
 
         let mut rng = rand::thread_rng();
-        for n in 0..10000 {
+        for n in 0..100 {
             let mut x: Vec<Update> = (0..1024).map(Update::Put).collect();
             let mut y: Vec<Update> = Vec::new();
 
