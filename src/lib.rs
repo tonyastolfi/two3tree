@@ -48,6 +48,26 @@ where
     }
 }
 
+fn upper_bound_by_key<'a, B, F, T: 'a, V: std::ops::Deref<Target = [T]>>(
+    v: &'a V,
+    b: &B,
+    mut f: F,
+) -> usize
+where
+    B: Ord + Eq,
+    F: FnMut(&'a T) -> B,
+{
+    match v.binary_search_by_key(b, |x| f(x)) {
+        Result::Ok(mut i) => {
+            while i < v.len() && &f(&v[i]) == b {
+                i += 1
+            }
+            i
+        }
+        Result::Err(i) => i,
+    }
+}
+
 #[derive(Debug)]
 pub enum Node {
     Binary {
@@ -129,6 +149,9 @@ impl Queue {
     pub fn from_batch(batch: Vec<Update>) -> Self {
         Self(sort_batch(batch))
     }
+    pub fn consume(self) -> Vec<Update> {
+        self.0
+    }
     pub fn merge(self, batch: Vec<Update>) -> Self {
         use itertools::EitherOrBoth::{Both, Left, Right};
 
@@ -144,6 +167,17 @@ impl Queue {
                 })
                 .collect(),
         )
+    }
+
+    pub fn iter<'a>(&'a self) -> impl Iterator<Item = &'a Update> + 'a {
+        self.0.iter()
+    }
+
+    pub fn find<'a>(&'a self, key: &K) -> Option<&'a Update> {
+        match self.0.binary_search_by_key(key, |msg| *msg.key()) {
+            Result::Ok(index) => Some(&self.0[index]),
+            Result::Err(_) => None,
+        }
     }
     pub fn partition(&self, part: Partition<(), K>) -> Partition<usize, K> {
         use Partition::{Part2, Part3};
@@ -174,8 +208,9 @@ impl Queue {
         let Self(ref queue) = self;
         queue.len()
     }
-    pub fn flush(
+    fn flush(
         &mut self,
+        config: &TreeConfig,
         partition: &Partition<usize, K>,
         plan: &FlushPlan<usize>,
     ) -> FlushPlan<Vec<Update>> {
@@ -196,25 +231,46 @@ impl Queue {
                 FlushRight(batch)
             }
             (Part3(len0, _, len1, _, len2), FlushMiddle(flush1)) => {
-                let batch = queue.drain(*len0..(len0 + len1)).collect();
+                assert!(*flush1 >= config.batch_size / 2);
+                assert!(*flush1 <= config.batch_size);
+
+                let batch = queue.drain(*len0..(len0 + flush1)).collect();
                 FlushMiddle(batch)
             }
             (Part3(len0, _, len1, _, len2), FlushLeftMiddle(flush0, flush1)) => {
-                let prefix_len = len0 + len1;
-                let new_queue = queue.split_off(prefix_len);
-                let Queue(left_batch) = std::mem::replace(self, Queue(new_queue));
-                let middle_batch = left_batch.split_off(*len0);
+                assert!(*flush0 >= config.batch_size / 2);
+                assert!(*flush0 <= config.batch_size);
+                assert!(*flush1 >= config.batch_size / 2);
+                assert!(*flush1 <= config.batch_size);
+
+                let pivot = len0;
+                let mut left_batch: Vec<Update> =
+                    queue.drain((pivot - flush0)..(pivot + flush1)).collect();
+                let middle_batch = left_batch.split_off(*flush0);
+
                 FlushLeftMiddle(left_batch, middle_batch)
             }
             (Part3(len0, _, len1, _, len2), FlushLeftRight(flush0, flush2)) => {
-                let FlushLeft(left_batch) = self.flush(partition, &FlushLeft(*flush0));
-                let FlushRight(right_batch) = self.flush(partition, &FlushRight(*flush2));
-                FlushLeftRight(left_batch, right_batch)
+                if let FlushLeft(left_batch) = self.flush(config, partition, &FlushLeft(*flush0)) {
+                    if let FlushRight(right_batch) =
+                        self.flush(config, partition, &FlushRight(*flush2))
+                    {
+                        return FlushLeftRight(left_batch, right_batch);
+                    }
+                }
+                panic!("unreachable case!");
             }
             (Part3(len0, _, len1, _, len2), FlushMiddleRight(flush1, flush2)) => {
-                let suffix_len = len1 + len2;
-                let middle_batch = queue.split_off(queue.len() - suffix_len);
-                let right_batch = middle_batch.split_off(*len1);
+                assert!(*flush1 >= config.batch_size / 2);
+                assert!(*flush1 <= config.batch_size);
+                assert!(*flush2 >= config.batch_size / 2);
+                assert!(*flush2 <= config.batch_size);
+
+                let pivot = len0 + len1;
+                let mut middle_batch: Vec<Update> =
+                    queue.drain((pivot - flush1)..(pivot + flush2)).collect();
+                let right_batch = middle_batch.split_off(*flush1);
+
                 FlushMiddleRight(middle_batch, right_batch)
             }
             _ => panic!("partition/plan mismatch"),
@@ -222,6 +278,7 @@ impl Queue {
     }
 }
 
+#[derive(Debug)]
 enum FlushPlan<T> {
     NoFlush,
     FlushLeft(T),
@@ -237,9 +294,14 @@ impl FlushPlan<usize> {
         use FlushPlan::*;
         use Partition::{Part2, Part3};
 
-        let clamp = |n: &usize| {
-            assert!(n >= &(config.batch_size / 2));
-            std::cmp::min(*n, config.batch_size)
+        let take_batch = |n: usize| {
+            if n < config.batch_size / 2 {
+                0
+            } else if n > config.batch_size {
+                config.batch_size
+            } else {
+                n
+            }
         };
 
         match part {
@@ -250,64 +312,77 @@ impl FlushPlan<usize> {
                     NoFlush
                 } else {
                     if len0 >= len1 {
-                        FlushLeft(clamp(len0))
+                        FlushLeft(take_batch(*len0))
                     } else {
-                        FlushRight(clamp(len1))
+                        FlushRight(take_batch(*len1))
                     }
                 }
             }
             Part3(len0, _, len1, _, len2) => {
+                let total = len0 + len1 + len2;
                 let (pair0, pair1) = (len0 + len1, len1 + len2);
 
-                assert!(pair0 <= 2 * config.batch_size);
-                assert!(pair1 <= 2 * config.batch_size);
+                //                assert!(total <= config.batch_size * 2);
+                assert!(*len0 <= config.batch_size * 2);
+                assert!(*len1 <= config.batch_size * 2);
+                assert!(*len2 <= config.batch_size * 2);
 
-                let need_to_flush = |n: usize| {
-                    if n > config.batch_size {
-                        Some(n - config.batch_size)
-                    } else {
-                        None
-                    }
+                let good3 = |new_total, new_pair0, new_pair1| -> bool {
+                    new_total <= config.batch_size * 2
+                        && new_pair0 <= config.batch_size
+                        && new_pair1 <= config.batch_size
+                };
+                let good2 = |new_total, new_pair0, new_pair1| -> bool {
+                    new_total <= config.batch_size
+                        && new_pair0 <= config.batch_size
+                        && new_pair1 <= config.batch_size
                 };
 
-                match (need_to_flush(pair0), need_to_flush(pair1)) {
-                    (Some(need_to_flush0), Some(need_to_flush1)) => {
-                        if len1 >= &need_to_flush0 {
-                            if len1 >= &need_to_flush1 {
-                                FlushMiddle(clamp(len1))
-                            } else {
-                                assert!(len2 >= &need_to_flush1);
-                                FlushMiddleRight(clamp(len1), clamp(len2))
-                            }
+                let (batch0, batch1, batch2) =
+                    (take_batch(*len0), take_batch(*len1), take_batch(*len2));
+
+                if good3(total, pair0, pair1) {
+                    if batch0 != 0 {
+                        if batch1 != 0 {
+                            FlushLeftMiddle(batch0, batch1)
+                        } else if batch2 != 0 {
+                            FlushLeftRight(batch0, batch2)
                         } else {
-                            assert!(len0 >= &need_to_flush0);
-                            if len1 >= &need_to_flush1 {
-                                FlushLeftMiddle(clamp(len0), clamp(len1))
-                            } else {
-                                assert!(len2 >= &need_to_flush1);
-                                FlushLeftRight(clamp(len0), clamp(len2))
-                            }
+                            FlushLeft(batch0)
                         }
-                    }
-                    (None, Some(need_to_flush1)) => {
-                        if len1 >= &need_to_flush1 {
-                            FlushMiddle(clamp(len1))
-                        } else if len2 >= &need_to_flush1 {
-                            FlushRight(clamp(len2))
+                    } else if batch1 != 0 {
+                        if batch2 != 0 {
+                            FlushMiddleRight(batch1, batch2)
                         } else {
-                            FlushMiddleRight(clamp(len1), clamp(len2))
+                            FlushMiddle(batch1)
                         }
+                    } else if batch2 != 0 {
+                        FlushRight(batch2)
+                    } else {
+                        NoFlush
                     }
-                    (Some(need_to_flush0), None) => {
-                        if len1 >= &need_to_flush0 {
-                            FlushMiddle(clamp(len1))
-                        } else if len0 >= &need_to_flush0 {
-                            FlushLeft(clamp(len0))
-                        } else {
-                            FlushLeftMiddle(clamp(len0), clamp(len1))
-                        }
-                    }
-                    (None, None) => NoFlush,
+                } else if good2(total - batch1, pair0 - batch1, pair1 - batch1) {
+                    FlushMiddle(batch1)
+                } else if good2(total - batch0, pair0 - batch0, pair1) {
+                    FlushLeft(batch0)
+                } else if good2(total - batch2, pair0, pair1 - batch2) {
+                    FlushRight(batch2)
+                } else if good2(
+                    total - (batch0 + batch1),
+                    pair0 - (batch0 + batch1),
+                    pair1 - batch1,
+                ) {
+                    FlushLeftMiddle(batch0, batch1)
+                } else if good2(
+                    total - (batch1 + batch2),
+                    pair0 - batch1,
+                    pair1 - (batch1 + batch2),
+                ) {
+                    FlushMiddleRight(batch1, batch2)
+                } else if good2(total - (batch0 + batch2), pair0 - batch0, pair1 - batch2) {
+                    FlushLeftRight(batch0, batch2)
+                } else {
+                    panic!("no good plans!  {:?}, config={:?}", part, config);
                 }
             }
         }
@@ -321,6 +396,20 @@ pub enum Update {
 }
 
 impl Node {
+    fn is_binary(&self) -> bool {
+        match self {
+            Node::Binary { .. } => true,
+            _ => false,
+        }
+    }
+
+    fn is_ternary(&self) -> bool {
+        match self {
+            Node::Ternary { .. } => true,
+            _ => false,
+        }
+    }
+
     fn binary(b0: Subtree, m1: i32, b1: Subtree) -> Self {
         assert_eq!(b0.height(), b1.height());
         Node::Binary {
@@ -330,6 +419,7 @@ impl Node {
             right: b1,
         }
     }
+
     fn ternary(b0: Subtree, m1: i32, b1: Subtree, m2: i32, b2: Subtree) -> Self {
         assert_eq!(b0.height(), b1.height());
         assert_eq!(b1.height(), b2.height());
@@ -343,6 +433,7 @@ impl Node {
             right: b2,
         }
     }
+
     fn partition(&self) -> Partition<(), K> {
         use Partition::{Part2, Part3};
 
@@ -364,20 +455,137 @@ impl Node {
             } => Part3((), *middle_min, (), *right_min, ()),
         }
     }
-    /*
-    fn flush(self, plan: FlushPlan<Vec<Update>>) -> NodeBuilder {
+
+    fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = &'a i32> + 'a> {
+        match self {
+            Node::Binary {
+                height: _,
+                left,
+                right_min: _,
+                right,
+            } => Box::new(left.iter().chain(right.iter())),
+
+            Node::Ternary {
+                height: _,
+                left,
+                middle_min: _,
+                middle,
+                right_min: _,
+                right,
+            } => Box::new(left.iter().chain(middle.iter()).chain(right.iter())),
+        }
+    }
+
+    fn flush(self, config: &TreeConfig, plan: FlushPlan<Vec<Update>>) -> NodeBuilder {
         use FlushPlan::*;
+        use UpdateResult::Done;
 
         match plan {
             NoFlush => NodeBuilder::from_node(self),
-            FlushLeft(left_batch) => {}
-            FlushRight(right_batch) => {}
-            FlushMiddle(middle_batch) => {}
-            FlushLeftMiddle(left_batch, middle_batch) => {}
-            FlushLeftRight(left_batch, right_batch) => {}
-            FlushMiddleRight(middle_batch, right_batch) => {}
+            FlushLeft(left_batch) => match self {
+                Node::Binary {
+                    height: _,
+                    left,
+                    right_min,
+                    right,
+                } => NodeBuilder::new(left.update(config, left_batch)).update(
+                    config,
+                    right_min,
+                    Done(right),
+                ),
+
+                Node::Ternary {
+                    height: _,
+                    left,
+                    middle_min,
+                    middle,
+                    right_min,
+                    right,
+                } => NodeBuilder::new(left.update(config, left_batch))
+                    .update(config, middle_min, Done(middle))
+                    .update(config, right_min, Done(right)),
+            },
+            FlushRight(right_batch) => match self {
+                Node::Binary {
+                    height: _,
+                    left,
+                    right_min,
+                    right,
+                } => NodeBuilder::new(Done(left)).update(
+                    config,
+                    right_min,
+                    right.update(config, right_batch),
+                ),
+
+                Node::Ternary {
+                    height: _,
+                    left,
+                    middle_min,
+                    middle,
+                    right_min,
+                    right,
+                } => NodeBuilder::new(Done(left))
+                    .update(config, middle_min, Done(middle))
+                    .update(config, right_min, right.update(config, right_batch)),
+            },
+            FlushMiddle(middle_batch) => match self {
+                Node::Ternary {
+                    height: _,
+                    left,
+                    middle_min,
+                    middle,
+                    right_min,
+                    right,
+                } => NodeBuilder::new(Done(left))
+                    .update(config, middle_min, middle.update(config, middle_batch))
+                    .update(config, right_min, Done(right)),
+
+                _ => panic!("Ternary Node plan applied to a Binary Node!"),
+            },
+            FlushLeftMiddle(left_batch, middle_batch) => match self {
+                Node::Ternary {
+                    height: _,
+                    left,
+                    middle_min,
+                    middle,
+                    right_min,
+                    right,
+                } => NodeBuilder::new(left.update(config, left_batch))
+                    .update(config, middle_min, middle.update(config, middle_batch))
+                    .update(config, right_min, Done(right)),
+
+                _ => panic!("Ternary Node plan applied to a Binary Node!"),
+            },
+            FlushLeftRight(left_batch, right_batch) => match self {
+                Node::Ternary {
+                    height: _,
+                    left,
+                    middle_min,
+                    middle,
+                    right_min,
+                    right,
+                } => NodeBuilder::new(left.update(config, left_batch))
+                    .update(config, middle_min, Done(middle))
+                    .update(config, right_min, right.update(config, right_batch)),
+
+                _ => panic!("Ternary Node plan applied to a Binary Node!"),
+            },
+            FlushMiddleRight(middle_batch, right_batch) => match self {
+                Node::Ternary {
+                    height: _,
+                    left,
+                    middle_min,
+                    middle,
+                    right_min,
+                    right,
+                } => NodeBuilder::new(Done(left))
+                    .update(config, middle_min, middle.update(config, middle_batch))
+                    .update(config, right_min, right.update(config, right_batch)),
+
+                _ => panic!("Ternary Node plan applied to a Binary Node!"),
+            },
         }
-    }*/
+    }
 }
 
 #[derive(Debug)]
@@ -421,10 +629,10 @@ impl Update {
             Delete(key) => key,
         }
     }
-    pub fn resolve(&self) -> Option<i32> {
+    pub fn resolve<'a>(&'a self) -> Option<&'a i32> {
         use Update::{Delete, Put};
         match self {
-            Put(key) => Some(*key),
+            Put(key) => Some(key),
             Delete(key) => None,
         }
     }
@@ -434,7 +642,8 @@ impl Update {
 pub enum UpdateResult {
     Done(Subtree),
     Split(Subtree, i32, Subtree),
-    Merge(Orphan),
+    Merge(Orphan),     // child-level
+    DeepMerge(Orphan), // grandchild-level
 }
 
 impl Split for UpdateResult {
@@ -507,7 +716,12 @@ macro_rules! split {
 }
 
 pub fn fuse_vals(mut v0: Vec<i32>, mut v1: Vec<i32>) -> Vec<i32> {
-    assert!(v0.last() <= v1.first());
+    assert!(
+        v0.last() <= v1.first().or(v0.last()),
+        "fuse_vals: out-of-order\n  v0={:?}\n  v1={:?}",
+        v0,
+        v1
+    );
     v0.append(&mut v1);
     v0
 }
@@ -567,49 +781,41 @@ impl Subtree {
 
     fn new(batch: Vec<Update>) -> Self {
         Subtree::Leaf {
-            vals: batch.iter().filter_map(|update| update.resolve()).collect(),
+            vals: batch
+                .iter()
+                .filter_map(|update| update.resolve())
+                .map(|item_ref| *item_ref)
+                .collect(),
+        }
+    }
+
+    fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = &'a i32> + 'a> {
+        use itertools::EitherOrBoth::{Both, Left, Right};
+        use Subtree::{Branch, Leaf};
+
+        match self {
+            Leaf { vals } => Box::new(vals.iter()),
+            Branch(ref branch) => {
+                let BufferNode {
+                    queue: Queue(ref updates),
+                    ref node,
+                } = &**branch;
+
+                Box::new(
+                    node.iter()
+                        .merge_join_by(updates.iter(), |a, b| a.cmp(&b.key()))
+                        .filter_map(|either| match either {
+                            Left(from_subtree) => Some(from_subtree),
+                            Right(from_updates) => from_updates.resolve(),
+                            Both(_, from_updates) => from_updates.resolve(),
+                        }),
+                )
+            }
         }
     }
 
     fn to_vec(&self, dst: &mut Vec<i32>) {
-        use Subtree::{Branch, Leaf};
-
-        match self {
-            Leaf { vals } => {
-                dst.extend(vals);
-            }
-            Branch(ref branch) => match &**branch {
-                BufferNode {
-                    queue: _,
-                    node:
-                        Node::Binary {
-                            height: _,
-                            left,
-                            right_min,
-                            right,
-                        },
-                } => {
-                    left.to_vec(dst);
-                    right.to_vec(dst);
-                }
-                BufferNode {
-                    queue: _,
-                    node:
-                        Node::Ternary {
-                            height: _,
-                            left,
-                            middle_min,
-                            middle,
-                            right_min,
-                            right,
-                        },
-                } => {
-                    left.to_vec(dst);
-                    middle.to_vec(dst);
-                    right.to_vec(dst);
-                }
-            },
-        }
+        dst.extend(self.iter());
     }
 
     fn find(&self, key: &i32) -> Option<&i32> {
@@ -622,7 +828,7 @@ impl Subtree {
             },
             Branch(ref branch) => match &**branch {
                 BufferNode {
-                    queue: _,
+                    queue,
                     node:
                         Node::Binary {
                             height: _,
@@ -630,15 +836,18 @@ impl Subtree {
                             right_min,
                             right,
                         },
-                } => {
-                    if key < right_min {
-                        left.find(key)
-                    } else {
-                        right.find(key)
+                } => match queue.find(key) {
+                    Some(ref update) => update.resolve(),
+                    None => {
+                        if key < right_min {
+                            left.find(key)
+                        } else {
+                            right.find(key)
+                        }
                     }
-                }
+                },
                 BufferNode {
-                    queue: _,
+                    queue,
                     node:
                         Node::Ternary {
                             height: _,
@@ -648,15 +857,18 @@ impl Subtree {
                             right_min,
                             right,
                         },
-                } => {
-                    if key < middle_min {
-                        left.find(key)
-                    } else if key < right_min {
-                        middle.find(key)
-                    } else {
-                        right.find(key)
+                } => match queue.find(key) {
+                    Some(ref update) => update.resolve(),
+                    None => {
+                        if key < middle_min {
+                            left.find(key)
+                        } else if key < right_min {
+                            middle.find(key)
+                        } else {
+                            right.find(key)
+                        }
                     }
-                }
+                },
             },
         }
     }
@@ -719,6 +931,62 @@ impl Subtree {
         }
     }
 
+    fn deep_merge_left(self, config: &TreeConfig, orphan: Orphan, left_min: i32) -> MergeResult {
+        use MergeResult::{Done, Split};
+        use Subtree::{Branch, Leaf};
+
+        match self {
+            Leaf { .. } => panic!("Can't deep merge a leaf!"),
+            Branch(mut branch) => match *branch {
+                BufferNode {
+                    queue,
+                    node:
+                        Node::Binary {
+                            height: _,
+                            left: b0,
+                            right_min: m2,
+                            right: b2,
+                        },
+                } => {
+                    match b0.merge_left(config, orphan, left_min) {
+                        Done(b0) => {
+                            *branch = make_buffer_node![queue, b0, m2, b2];
+                        }
+                        Split(b0, m1, b1) => {
+                            *branch = make_buffer_node![queue, b0, m1, b1, m2, b2];
+                        }
+                    }
+                    Done(Branch(branch))
+                }
+                BufferNode {
+                    queue,
+                    node:
+                        Node::Ternary {
+                            height: _,
+                            left: b0,
+                            middle_min: m2,
+                            middle: b2,
+                            right_min: m3,
+                            right: b3,
+                        },
+                } => match b0.merge_left(config, orphan, left_min) {
+                    Done(b0) => {
+                        *branch = make_buffer_node![queue, b0, m2, b2, m3, b3];
+                        Done(Branch(branch))
+                    }
+                    Split(b0, m1, b1) => {
+                        let (left_queue, right_queue) = queue.split(&m2);
+                        assert!(left_queue.len() <= config.batch_size);
+                        assert!(right_queue.len() <= config.batch_size);
+
+                        *branch = make_buffer_node![left_queue, b0, m1, b1];
+                        Split(Branch(branch), m2, make_branch![right_queue, b2, m3, b3])
+                    }
+                },
+            },
+        }
+    }
+
     fn merge_right(self, config: &TreeConfig, orphan_min: i32, orphan: Orphan) -> MergeResult {
         use MergeResult::{Done, Split};
         use Orphan::{Child, Items};
@@ -777,8 +1045,69 @@ impl Subtree {
         }
     }
 
+    fn deep_merge_right(self, config: &TreeConfig, orphan_min: i32, orphan: Orphan) -> MergeResult {
+        use MergeResult::{Done, Split};
+        use Subtree::{Branch, Leaf};
+
+        match self {
+            Leaf { .. } => panic!("Can't deep merge a leaf!"),
+            Branch(mut branch) => match *branch {
+                BufferNode {
+                    queue,
+                    node:
+                        Node::Binary {
+                            height: _,
+                            left: b0,
+                            right_min: m1,
+                            right: b1,
+                        },
+                } => {
+                    match b1.merge_right(config, orphan_min, orphan) {
+                        Done(b1) => {
+                            *branch = make_buffer_node![queue, b0, m1, b1];
+                        }
+                        Split(b1, m2, b2) => {
+                            *branch = make_buffer_node![queue, b0, m1, b1, m2, b2];
+                        }
+                    }
+                    Done(Branch(branch))
+                }
+                BufferNode {
+                    queue,
+                    node:
+                        Node::Ternary {
+                            height: _,
+                            left: b0,
+                            middle_min: m1,
+                            middle: b1,
+                            right_min: m2,
+                            right: b2,
+                        },
+                } => match b2.merge_right(config, orphan_min, orphan) {
+                    Done(b2) => {
+                        *branch = make_buffer_node![queue, b0, m1, b1, m2, b2];
+                        Done(Branch(branch))
+                    }
+                    Split(b2, m3, b3) => {
+                        let (left_queue, right_queue) = queue.split(&m2);
+                        assert!(left_queue.len() <= config.batch_size);
+                        assert!(right_queue.len() <= config.batch_size);
+
+                        *branch = make_buffer_node![left_queue, b0, m1, b1];
+                        Split(Branch(branch), m2, make_branch![right_queue, b2, m3, b3])
+                    }
+                },
+            },
+        }
+    }
+
     fn update(self, config: &TreeConfig, batch: Vec<Update>) -> UpdateResult {
-        assert!(batch.len() <= config.batch_size);
+        assert!(
+            batch.len() <= config.batch_size,
+            "batch too large (B={}), batch={:?}",
+            config.batch_size,
+            batch
+        );
 
         match self {
             Subtree::Leaf { vals } => update_leaf(config, batch, vals),
@@ -795,8 +1124,8 @@ pub fn update_leaf(config: &TreeConfig, batch: Vec<Update>, vals: Vec<i32>) -> U
         .merge_join_by(batch.iter(), |old, update| old.cmp(&update.key()))
         .filter_map(|either| match either {
             Left(old) => Some(*old),
-            Right(update) => update.resolve(),
-            Both(_old, update) => update.resolve(),
+            Right(update) => update.resolve().map(|item_ref| *item_ref),
+            Both(_old, update) => update.resolve().map(|item_ref| *item_ref),
         })
         .collect();
 
@@ -824,6 +1153,7 @@ pub fn maybe_split_leaf<Result: Split + Done>(config: &TreeConfig, mut vals: Vec
 #[derive(Debug)]
 enum NodeBuilder {
     MergeLeft(Orphan),
+    DeepMergeLeft(Orphan),
     Branch1(Subtree),
     Branch2(Subtree, i32, Subtree),
     Branch3(Subtree, i32, Subtree, i32, Subtree),
@@ -863,16 +1193,22 @@ impl NodeBuilder {
             Done(b0) => Branch1(b0),
             Split(b0, m1, b1) => Branch2(b0, m1, b1),
             Merge(orphan) => MergeLeft(orphan),
+            DeepMerge(orphan) => DeepMergeLeft(orphan),
         }
     }
     fn update(self, config: &TreeConfig, next_min: i32, next: UpdateResult) -> Self {
         use NodeBuilder::*;
+        use Orphan::{Child, Items};
         use UpdateResult::*;
 
         match (self, next_min, next) {
-            // Fuse case - 0 => 1
+            // Fuse case - 0 => 0,1
             //
             (MergeLeft(o0), m1, Merge(o1)) => Branch1(fuse_orphans(config, o0, m1, o1)),
+            (DeepMergeLeft(oo0), m1, DeepMerge(oo1)) => {
+                MergeLeft(Child(fuse_orphans(config, oo0, m1, oo1)))
+            }
+
             // Done cases - grow by 1
             //
             (Branch1(b0), m1, Done(b1)) => Branch2(b0, m1, b1),
@@ -884,6 +1220,7 @@ impl NodeBuilder {
             (Branch5(b0, m1, b1, m2, b2, m3, b3, m4, b4), m5, Done(b5)) => {
                 Branch6(b0, m1, b1, m2, b2, m3, b3, m4, b4, m5, b5)
             }
+
             // Split cases - grow by 2
             //
             (Branch1(b0), m1, Split(b1, m2, b2)) => Branch3(b0, m1, b1, m2, b2),
@@ -894,6 +1231,7 @@ impl NodeBuilder {
             (Branch4(b0, m1, b1, m2, b2, m3, b3), m4, Split(b4, m5, b5)) => {
                 Branch6(b0, m1, b1, m2, b2, m3, b3, m4, b4, m5, b5)
             }
+
             // Merge cases - grow by 0 or 1
             //
             (MergeLeft(o0), m0, Done(b0)) => match b0.merge_left(config, o0, m0) {
@@ -934,6 +1272,66 @@ impl NodeBuilder {
             }
             (Branch5(..), _, Split(..)) => panic!("NodeBuilder is full!"),
             (Branch6(..), _, _) => panic!("NodeBuilder is full!"),
+
+            // Deep Merge cases
+            //
+            (DeepMergeLeft(oo0), m0, Done(b0)) => match b0.deep_merge_left(config, oo0, m0) {
+                MergeResult::Done(b0) => Branch1(b0),
+                MergeResult::Split(b0, m1, b1) => Branch2(b0, m1, b1),
+            },
+            (DeepMergeLeft(oo0), m1, Split(b1, m2, b2)) => {
+                match b1.deep_merge_left(config, oo0, m1) {
+                    MergeResult::Done(b1) => Branch2(b1, m2, b2),
+                    MergeResult::Split(b0, m1, b1) => Branch3(b0, m1, b1, m2, b2),
+                }
+            }
+            (DeepMergeLeft(oo0), m1, Merge(Child(o1))) => match o1.merge_left(config, oo0, m1) {
+                MergeResult::Done(o1) => MergeLeft(Child(o1)),
+                MergeResult::Split(o1, m2, o2) => {
+                    Branch1(fuse_orphans(config, Child(o1), m2, Child(o2)))
+                }
+            },
+            (MergeLeft(Items(_)), _, DeepMerge(_)) => {
+                panic!("tried to deep merge right below leaf");
+            }
+            (DeepMergeLeft(_), _, Merge(Items(_))) => {
+                panic!("tried to deep merge left below leaf");
+            }
+            (MergeLeft(Child(o0)), m1, DeepMerge(oo1)) => match o0.merge_right(config, m1, oo1) {
+                MergeResult::Done(o0) => MergeLeft(Child(o0)),
+                MergeResult::Split(o0, m1, o1) => {
+                    Branch1(fuse_orphans(config, Child(o0), m1, Child(o1)))
+                }
+            },
+            (Branch1(b0), m1, DeepMerge(oo1)) => match b0.deep_merge_right(config, m1, oo1) {
+                MergeResult::Done(b0) => Branch1(b0),
+                MergeResult::Split(b0, m1, b1) => Branch2(b0, m1, b1),
+            },
+            (Branch2(b0, m1, b1), m2, DeepMerge(oo2)) => match b1.deep_merge_right(config, m2, oo2)
+            {
+                MergeResult::Done(b1) => Branch2(b0, m1, b1),
+                MergeResult::Split(b1, m2, b2) => Branch3(b0, m1, b1, m2, b2),
+            },
+            (Branch3(b0, m1, b1, m2, b2), m3, DeepMerge(oo3)) => {
+                match b2.deep_merge_right(config, m3, oo3) {
+                    MergeResult::Done(b2) => Branch3(b0, m1, b1, m2, b2),
+                    MergeResult::Split(b2, m3, b3) => Branch4(b0, m1, b1, m2, b2, m3, b3),
+                }
+            }
+            (Branch4(b0, m1, b1, m2, b2, m3, b3), m4, DeepMerge(oo4)) => {
+                match b3.deep_merge_right(config, m4, oo4) {
+                    MergeResult::Done(b3) => Branch4(b0, m1, b1, m2, b2, m3, b3),
+                    MergeResult::Split(b3, m4, b4) => Branch5(b0, m1, b1, m2, b2, m3, b3, m4, b4),
+                }
+            }
+            (Branch5(b0, m1, b1, m2, b2, m3, b3, m4, b4), m5, DeepMerge(oo5)) => {
+                match b4.deep_merge_right(config, m5, oo5) {
+                    MergeResult::Done(b4) => Branch5(b0, m1, b1, m2, b2, m3, b3, m4, b4),
+                    MergeResult::Split(b4, m5, b5) => {
+                        Branch6(b0, m1, b1, m2, b2, m3, b3, m4, b4, m5, b5)
+                    }
+                }
+            }
         }
     }
 
@@ -966,7 +1364,7 @@ pub fn update_node(
     use NodeBuilder::*;
     use Orphan::Child;
     use Subtree::Branch;
-    use UpdateResult::{Done, Merge, Split};
+    use UpdateResult::{DeepMerge, Done, Merge, Split};
 
     if batch.is_empty() {
         return Done(Subtree::Branch(branch));
@@ -976,30 +1374,20 @@ pub fn update_node(
 
     use itertools::EitherOrBoth::{Both, Left, Right};
 
-    assert!(queue.len() <= config.batch_size);
+    assert!(batch.len() <= config.batch_size);
+    assert!(!node.is_binary() || queue.len() <= config.batch_size);
+    assert!(!node.is_ternary() || queue.len() <= config.batch_size * 3 / 2);
 
-    batch.sort_by_cached_key(|update| *update.key());
-
-    queue.merge(batch);
-
+    let mut queue = queue.merge(batch);
     let queue_partition = queue.partition(node.partition());
-
-    use NodeBuilder::{Branch2, Branch3};
-
+    let queue_parts_debug = format!("{:?}", queue_partition);
     let queue_plan = FlushPlan::new(config, &queue_partition);
-    let batch_plan = queue.flush(&queue_partition, &queue_plan);
-
-    if updates.len() <= config.batch_size {
-        *branch = BufferNode {
-            queue: updates,
-            node,
-        };
-        return Done(Subtree::Branch(branch));
-    }
-
-    assert!(queue.len() <= config.batch_size * 2);
+    let queue_plan_debug = format!("{:?}", queue_plan);
+    let batch_plan = queue.flush(config, &queue_partition, &queue_plan);
+    let builder = node.flush(config, batch_plan);
 
     return match builder {
+        MergeLeft(o0) => DeepMerge(o0),
         Branch1(b0) =>
         //
         // TODO - Before we return in this case, send any remaining queued updates down to `b0`.
@@ -1013,22 +1401,58 @@ pub fn update_node(
         //        key range has expanded to fill the entire range of its parent; there is no other
         //        Subtree that can 'claim' ownership of the key range of the defunct sibling of `b0`.
         {
-            Merge(Child(b0))
+            if queue.len() == 0 {
+                Merge(Child(b0))
+            } else {
+                //let b0_debug = format!("{:?}", b0);
+                //let q_debug = format!("{:?}", queue);
+                match b0.update(config, queue.consume()) {
+                    Done(b0) => Merge(Child(b0)),
+                    Split(b0, m1, b1) => {
+                        assert!(b0.is_viable(config));
+                        assert!(b1.is_viable(config));
+
+                        *branch = make_buffer_node![Queue::new(), b0, m1, b1];
+                        Done(Branch(branch))
+                    }
+                    Merge(orphan) => DeepMerge(orphan),
+                    DeepMerge(_) => panic!("implement arbitrarily deep merges"),
+                }
+            }
         }
         Branch2(b0, m1, b1) => {
             assert!(b0.is_viable(config));
             assert!(b1.is_viable(config));
-            assert!(new_queue.len() <= config.batch_size);
+            assert!(
+                queue.len() <= config.batch_size,
+                "queue is too long!\n  queue.len()={}\n  b0={:#?}\n  b1={:#?}\n  queue={:?}, plan={:?}, parts={:?}",
+                queue.len(),
+                b0,
+                b1,
+                queue,
+                queue_plan_debug,
+                queue_parts_debug
+            );
 
-            *branch = make_buffer_node![new_queue, b0, m1, b1];
+            *branch = make_buffer_node![queue, b0, m1, b1];
             Done(Branch(branch))
         }
         Branch3(b0, m1, b1, m2, b2) => {
             assert!(b0.is_viable(config));
             assert!(b1.is_viable(config));
             assert!(b2.is_viable(config));
+            assert!(
+                queue.len() <= config.batch_size * 3 / 2,
+                "queue is too long!\n  queue.len()={}\n  b0={:#?}\n  b1={:#?}\n  b2={:#?}\n  queue={:?}, plan={:?}, parts={:?}",
+                queue.len(),
+                b0,
+                b1,b2,
+                queue,
+                queue_plan_debug,
+                queue_parts_debug
+            );
 
-            *branch = make_buffer_node![new_queue, b0, m1, b1, m2, b2];
+            *branch = make_buffer_node![queue, b0, m1, b1, m2, b2];
             Done(Branch(branch))
         }
         Branch4(b0, m1, b1, m2, b2, m3, b3) => {
@@ -1037,8 +1461,12 @@ pub fn update_node(
             assert!(b2.is_viable(config));
             assert!(b3.is_viable(config));
 
-            *branch = make_buffer_node![Vec::new(), b0, m1, b1];
-            split![branch, m2, Vec::new(), b2, m3, b3]
+            let (q0, q1) = queue.split(&m2);
+            assert!(q0.len() <= config.batch_size);
+            assert!(q1.len() <= config.batch_size);
+
+            *branch = make_buffer_node![q0, b0, m1, b1];
+            split![branch, m2, q1, b2, m3, b3]
         }
         Branch5(b0, m1, b1, m2, b2, m3, b3, m4, b4) => {
             assert!(b0.is_viable(config));
@@ -1047,8 +1475,12 @@ pub fn update_node(
             assert!(b3.is_viable(config));
             assert!(b4.is_viable(config));
 
-            *branch = make_buffer_node![Vec::new(), b0, m1, b1, m2, b2];
-            split![branch, m3, Vec::new(), b3, m4, b4]
+            let (q0, q1) = queue.split(&m3);
+            assert!(q0.len() <= config.batch_size * 3 / 2);
+            assert!(q1.len() <= config.batch_size);
+
+            *branch = make_buffer_node![q0, b0, m1, b1, m2, b2];
+            split![branch, m3, q1, b3, m4, b4]
         }
         Branch6(b0, m1, b1, m2, b2, m3, b3, m4, b4, m5, b5) => {
             assert!(b0.is_viable(config));
@@ -1058,8 +1490,12 @@ pub fn update_node(
             assert!(b4.is_viable(config));
             assert!(b5.is_viable(config));
 
-            *branch = make_buffer_node![Vec::new(), b0, m1, b1, m2, b2];
-            split![branch, m3, Vec::new(), b3, m4, b4, m5, b5]
+            let (q0, q1) = queue.split(&m3);
+            assert!(q0.len() <= config.batch_size * 3 / 2);
+            assert!(q1.len() <= config.batch_size * 3 / 2);
+
+            *branch = make_buffer_node![q0, b0, m1, b1, m2, b2];
+            split![branch, m3, q1, b3, m4, b4, m5, b5]
         }
         _ => panic!("update error! builder={:?}", builder),
     };
@@ -1090,7 +1526,7 @@ impl Tree {
     fn update(&mut self, batch: Vec<Update>) {
         use Orphan::{Child, Items};
         use Subtree::{Branch, Leaf};
-        use UpdateResult::{Done, Merge, Split};
+        use UpdateResult::{DeepMerge, Done, Merge, Split};
 
         let root = std::mem::replace(&mut self.root, Subtree::empty());
         self.root = match root.update(&self.config, batch) {
@@ -1100,11 +1536,15 @@ impl Tree {
 
             // Tree height grows (due to split).
             //
-            Split(b0, m1, b1) => make_branch![Vec::new(), b0, m1, b1],
+            Split(b0, m1, b1) => make_branch![Queue::new(), b0, m1, b1],
 
             // Tree height shrinks (due to merge).
             //
             Merge(orphan) => match orphan {
+                Items(vals) => Leaf { vals },
+                Child(branch) => branch,
+            },
+            DeepMerge(orphan) => match orphan {
                 Items(vals) => Leaf { vals },
                 Child(branch) => branch,
             },
@@ -1147,7 +1587,7 @@ mod tests {
         }
 
         for k in 0..1000 {
-            assert!(t.find(k) == Some(&k));
+            assert_eq!(t.find(k), Some(&k));
         }
 
         assert_eq!(t.height(), 6);
@@ -1157,33 +1597,35 @@ mod tests {
         }
 
         for k in 1000..100000 {
-            assert!(t.find(k) == Some(&k));
+            assert_eq!(t.find(k), Some(&k));
         }
 
-        assert_eq!(t.height(), 13);
+        assert_eq!(t.height(), 12);
     }
 
     #[test]
     fn remove_test() {
         let mut t = Tree::new(TreeConfig { batch_size: 8 });
+        let max_k: i32 = 100000;
 
-        for k in 0..100000 {
+        for k in 0..max_k {
             t.insert(k);
         }
 
-        for k in 0..100000 {
+        for k in 0..max_k {
             assert!(t.find(k) == Some(&k));
         }
 
-        assert_eq!(t.height(), 13);
+        assert_eq!(t.height(), 12);
 
-        for k in 0..100000 {
+        for k in 0..max_k {
             assert!(t.find(k) == Some(&k));
+            //println!("tree={:#?}, k={}", t, k);
             t.remove(k);
             assert!(t.find(k) == None, "k={}, tree={:#?}", k, t);
         }
 
-        for k in 0..100000 {
+        for k in 0..max_k {
             assert!(t.find(k) == None);
         }
 
