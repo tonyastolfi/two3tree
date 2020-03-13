@@ -6,6 +6,8 @@
 
 use itertools::Itertools;
 
+pub type K = i32;
+
 #[derive(Debug)]
 pub struct TreeConfig {
     pub batch_size: usize,
@@ -64,6 +66,260 @@ pub enum Node {
     },
 }
 
+impl Height for Node {
+    fn height(&self) -> u16 {
+        match self {
+            Node::Binary { height, .. } => *height,
+            Node::Ternary { height, .. } => *height,
+        }
+    }
+}
+
+impl Viable for Node {
+    fn is_viable(&self, _: &TreeConfig) -> bool {
+        true
+    }
+}
+
+#[derive(Debug)]
+pub enum Partition<T, P: Ord> {
+    Part2(T, P, T),
+    Part3(T, P, T, P, T),
+}
+
+impl<T, P: Ord> Partition<T, P> {
+    fn left<'a>(&'a self) -> &'a T {
+        use Partition::*;
+
+        match self {
+            Part2(left, ..) => left,
+            Part3(left, ..) => left,
+        }
+    }
+    fn middle<'a>(&'a self) -> Option<&'a T> {
+        use Partition::*;
+
+        match self {
+            Part2(..) => None,
+            Part3(_, _, middle, ..) => Some(middle),
+        }
+    }
+    fn right<'a>(&'a self) -> &'a T {
+        use Partition::*;
+
+        match self {
+            Part2(_, _, right) => right,
+            Part3(_, _, _, _, right) => right,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Queue(Vec<Update>);
+
+fn sort_batch(mut batch: Vec<Update>) -> Vec<Update> {
+    batch.sort_by_cached_key(|update| *update.key());
+    batch
+}
+
+impl Queue {
+    pub fn new() -> Self {
+        Self(Vec::new())
+    }
+    pub fn from_batch(batch: Vec<Update>) -> Self {
+        Self(sort_batch(batch))
+    }
+    pub fn merge(self, batch: Vec<Update>) -> Self {
+        use itertools::EitherOrBoth::{Both, Left, Right};
+
+        let Self(items) = self;
+        Self(
+            items
+                .into_iter()
+                .merge_join_by(sort_batch(batch).into_iter(), |a, b| a.key().cmp(b.key()))
+                .map(|either| match either {
+                    Left(update) => update,
+                    Right(update) => update,
+                    Both(_, latest) => latest,
+                })
+                .collect(),
+        )
+    }
+    pub fn partition(&self, part: Partition<(), K>) -> Partition<usize, K> {
+        use Partition::{Part2, Part3};
+
+        let Self(ref queue) = self;
+
+        match part {
+            Part2(_, p1, _) => {
+                let len0 = lower_bound_by_key(queue, &p1, |msg| *msg.key());
+                let len1 = queue.len() - len0;
+                Part2(len0, p1, len1)
+            }
+            Part3(_, p1, _, p2, _) => {
+                let len0 = lower_bound_by_key(queue, &p1, |msg| *msg.key());
+                let len1 = lower_bound_by_key(&&queue[len0..], &p2, |msg| *msg.key());
+                let len2 = queue.len() - (len0 + len1);
+                Part3(len0, p1, len1, p2, len2)
+            }
+        }
+    }
+    pub fn split(self, m: &i32) -> (Self, Self) {
+        let Self(mut queue) = self;
+        let ind = lower_bound_by_key(&queue, m, |update| *update.key());
+        let split: Vec<Update> = queue.split_off(ind);
+        (Self(queue), Self(split))
+    }
+    pub fn len(&self) -> usize {
+        let Self(ref queue) = self;
+        queue.len()
+    }
+    pub fn flush(
+        &mut self,
+        partition: &Partition<usize, K>,
+        plan: &FlushPlan<usize>,
+    ) -> FlushPlan<Vec<Update>> {
+        use FlushPlan::*;
+        use Partition::{Part2, Part3};
+
+        let Queue(ref mut queue) = self;
+
+        match (partition, plan) {
+            (_, NoFlush) => NoFlush,
+            (_, FlushLeft(prefix_len)) => {
+                let new_queue = queue.split_off(*prefix_len);
+                let Queue(batch) = std::mem::replace(self, Queue(new_queue));
+                FlushLeft(batch)
+            }
+            (_, FlushRight(suffix_len)) => {
+                let batch = queue.split_off(queue.len() - suffix_len);
+                FlushRight(batch)
+            }
+            (Part3(len0, _, len1, _, len2), FlushMiddle(flush1)) => {
+                let batch = queue.drain(*len0..(len0 + len1)).collect();
+                FlushMiddle(batch)
+            }
+            (Part3(len0, _, len1, _, len2), FlushLeftMiddle(flush0, flush1)) => {
+                let prefix_len = len0 + len1;
+                let new_queue = queue.split_off(prefix_len);
+                let Queue(left_batch) = std::mem::replace(self, Queue(new_queue));
+                let middle_batch = left_batch.split_off(*len0);
+                FlushLeftMiddle(left_batch, middle_batch)
+            }
+            (Part3(len0, _, len1, _, len2), FlushLeftRight(flush0, flush2)) => {
+                let FlushLeft(left_batch) = self.flush(partition, &FlushLeft(*flush0));
+                let FlushRight(right_batch) = self.flush(partition, &FlushRight(*flush2));
+                FlushLeftRight(left_batch, right_batch)
+            }
+            (Part3(len0, _, len1, _, len2), FlushMiddleRight(flush1, flush2)) => {
+                let suffix_len = len1 + len2;
+                let middle_batch = queue.split_off(queue.len() - suffix_len);
+                let right_batch = middle_batch.split_off(*len1);
+                FlushMiddleRight(middle_batch, right_batch)
+            }
+            _ => panic!("partition/plan mismatch"),
+        }
+    }
+}
+
+enum FlushPlan<T> {
+    NoFlush,
+    FlushLeft(T),
+    FlushRight(T),
+    FlushMiddle(T),
+    FlushLeftMiddle(T, T),
+    FlushLeftRight(T, T),
+    FlushMiddleRight(T, T),
+}
+
+impl FlushPlan<usize> {
+    fn new(config: &TreeConfig, part: &Partition<usize, K>) -> Self {
+        use FlushPlan::*;
+        use Partition::{Part2, Part3};
+
+        let clamp = |n: &usize| {
+            assert!(n >= &(config.batch_size / 2));
+            std::cmp::min(*n, config.batch_size)
+        };
+
+        match part {
+            Part2(len0, _, len1) => {
+                assert!(len0 + len1 <= 2 * config.batch_size);
+
+                if len0 + len1 <= config.batch_size {
+                    NoFlush
+                } else {
+                    if len0 >= len1 {
+                        FlushLeft(clamp(len0))
+                    } else {
+                        FlushRight(clamp(len1))
+                    }
+                }
+            }
+            Part3(len0, _, len1, _, len2) => {
+                let (pair0, pair1) = (len0 + len1, len1 + len2);
+
+                assert!(pair0 <= 2 * config.batch_size);
+                assert!(pair1 <= 2 * config.batch_size);
+
+                let need_to_flush = |n: usize| {
+                    if n > config.batch_size {
+                        Some(n - config.batch_size)
+                    } else {
+                        None
+                    }
+                };
+
+                match (need_to_flush(pair0), need_to_flush(pair1)) {
+                    (Some(need_to_flush0), Some(need_to_flush1)) => {
+                        if len1 >= &need_to_flush0 {
+                            if len1 >= &need_to_flush1 {
+                                FlushMiddle(clamp(len1))
+                            } else {
+                                assert!(len2 >= &need_to_flush1);
+                                FlushMiddleRight(clamp(len1), clamp(len2))
+                            }
+                        } else {
+                            assert!(len0 >= &need_to_flush0);
+                            if len1 >= &need_to_flush1 {
+                                FlushLeftMiddle(clamp(len0), clamp(len1))
+                            } else {
+                                assert!(len2 >= &need_to_flush1);
+                                FlushLeftRight(clamp(len0), clamp(len2))
+                            }
+                        }
+                    }
+                    (None, Some(need_to_flush1)) => {
+                        if len1 >= &need_to_flush1 {
+                            FlushMiddle(clamp(len1))
+                        } else if len2 >= &need_to_flush1 {
+                            FlushRight(clamp(len2))
+                        } else {
+                            FlushMiddleRight(clamp(len1), clamp(len2))
+                        }
+                    }
+                    (Some(need_to_flush0), None) => {
+                        if len1 >= &need_to_flush0 {
+                            FlushMiddle(clamp(len1))
+                        } else if len0 >= &need_to_flush0 {
+                            FlushLeft(clamp(len0))
+                        } else {
+                            FlushLeftMiddle(clamp(len0), clamp(len1))
+                        }
+                    }
+                    (None, None) => NoFlush,
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum Update {
+    Put(i32),
+    Delete(i32),
+}
+
 impl Node {
     fn binary(b0: Subtree, m1: i32, b1: Subtree) -> Self {
         assert_eq!(b0.height(), b1.height());
@@ -87,65 +343,41 @@ impl Node {
             right: b2,
         }
     }
-}
+    fn partition(&self) -> Partition<(), K> {
+        use Partition::{Part2, Part3};
 
-impl Height for Node {
-    fn height(&self) -> u16 {
         match self {
-            Node::Binary { height, .. } => *height,
-            Node::Ternary { height, .. } => *height,
+            Node::Binary {
+                height: _,
+                left: _,
+                right_min,
+                right: _,
+            } => Part2((), *right_min, ()),
+
+            Node::Ternary {
+                height: _,
+                left: _,
+                middle_min,
+                middle: _,
+                right_min,
+                right: _,
+            } => Part3((), *middle_min, (), *right_min, ()),
         }
     }
-}
+    /*
+    fn flush(self, plan: FlushPlan<Vec<Update>>) -> NodeBuilder {
+        use FlushPlan::*;
 
-impl Viable for Node {
-    fn is_viable(&self, _: &TreeConfig) -> bool {
-        true
-    }
-}
-
-#[derive(Debug)]
-pub struct UpdateBuffer(Vec<Update>);
-
-fn sort_batch(mut batch: Vec<Update>) -> Vec<Update> {
-    batch.sort_by_cached_key(|update| *update.key());
-    batch
-}
-
-impl UpdateBuffer {
-    pub fn new(batch: Vec<Update>) -> Self {
-        Self(sort_batch(batch))
-    }
-    pub fn merge(self, batch: Vec<Update>) -> Self {
-        use itertools::EitherOrBoth::{Both, Left, Right};
-
-        let Self(items) = self;
-        Self(
-            items
-                .into_iter()
-                .merge_join_by(sort_batch(batch).into_iter(), |a, b| a.key().cmp(b.key()))
-                .map(|either| match either {
-                    Left(update) => update,
-                    Right(update) => update,
-                    Both(_, latest) => latest,
-                })
-                .collect(),
-        )
-    }
-}
-
-pub enum NodeBufferView<'buffer> {
-    Binary {
-        buffer: &'buffer UpdateBuffer,
-        left_count: usize,
-        right_count: usize,
-    },
-    Ternary {
-        buffer: &'buffer UpdateBuffer,
-        left_count: usize,
-        middle_count: usize,
-        right_count: usize,
-    },
+        match plan {
+            NoFlush => NodeBuilder::from_node(self),
+            FlushLeft(left_batch) => {}
+            FlushRight(right_batch) => {}
+            FlushMiddle(middle_batch) => {}
+            FlushLeftMiddle(left_batch, middle_batch) => {}
+            FlushLeftRight(left_batch, right_batch) => {}
+            FlushMiddleRight(middle_batch, right_batch) => {}
+        }
+    }*/
 }
 
 #[derive(Debug)]
@@ -163,7 +395,7 @@ pub struct BufferNode {
     //  - at most 1 branch of binary nodes and at most 2 branches of ternary
     //    nodes cascade: 1/2 to 2/3 of the branches off a node.
     //
-    queue: Vec<Update>,
+    queue: Queue,
     node: Node,
 }
 
@@ -180,11 +412,6 @@ impl Viable for BufferNode {
 }
 
 //--------------------------------------------------------
-#[derive(Debug, Copy, Clone)]
-pub enum Update {
-    Put(i32),
-    Delete(i32),
-}
 
 impl Update {
     pub fn key<'a>(&'a self) -> &'a i32 {
@@ -298,18 +525,12 @@ pub fn fuse_orphans(config: &TreeConfig, left: Orphan, right_min: i32, right: Or
             }
         }
         (Child(left_subtree), Child(right_subtree)) => {
-            make_branch![Vec::new(), left_subtree, right_min, right_subtree]
+            make_branch![Queue::new(), left_subtree, right_min, right_subtree]
         }
         _ => {
             panic!("fuse must be called on like items.");
         }
     }
-}
-
-pub fn split_queue(mut queue: Vec<Update>, m: &i32) -> (Vec<Update>, Vec<Update>) {
-    let ind = lower_bound_by_key(&queue, m, |update| *update.key());
-    let split: Vec<Update> = queue.drain(ind..).collect();
-    (queue, split)
 }
 
 //--------------------------------------------------------
@@ -486,7 +707,7 @@ impl Subtree {
                 ) => {
                     assert!(m1 < m2);
 
-                    let (left_queue, right_queue) = split_queue(queue, &m2);
+                    let (left_queue, right_queue) = queue.split(&m2);
                     assert!(left_queue.len() <= config.batch_size);
                     assert!(right_queue.len() <= config.batch_size);
 
@@ -544,7 +765,7 @@ impl Subtree {
                 ) => {
                     assert!(m2 < m3, "m2={}, m3={}", m2, m3);
 
-                    let (left_queue, right_queue) = split_queue(queue, &m2);
+                    let (left_queue, right_queue) = queue.split(&m2);
                     assert!(left_queue.len() <= config.batch_size);
                     assert!(right_queue.len() <= config.batch_size);
 
@@ -715,6 +936,26 @@ impl NodeBuilder {
             (Branch6(..), _, _) => panic!("NodeBuilder is full!"),
         }
     }
+
+    fn from_node(node: Node) -> Self {
+        match node {
+            Node::Binary {
+                height: _,
+                left,
+                right_min,
+                right,
+            } => Self::Branch2(left, right_min, right),
+
+            Node::Ternary {
+                height: _,
+                left,
+                middle_min,
+                middle,
+                right_min,
+                right,
+            } => Self::Branch3(left, middle_min, middle, right_min, right),
+        }
+    }
 }
 
 pub fn update_node(
@@ -731,7 +972,7 @@ pub fn update_node(
         return Done(Subtree::Branch(branch));
     }
 
-    let BufferNode { queue, node } = *branch;
+    let BufferNode { mut queue, node } = *branch;
 
     use itertools::EitherOrBoth::{Both, Left, Right};
 
@@ -739,15 +980,14 @@ pub fn update_node(
 
     batch.sort_by_cached_key(|update| *update.key());
 
-    let mut updates: Vec<Update> = queue
-        .into_iter()
-        .merge_join_by(batch.into_iter(), |a, b| a.key().cmp(b.key()))
-        .map(|either| match either {
-            Left(update) => update,
-            Right(update) => update,
-            Both(_, latest) => latest,
-        })
-        .collect();
+    queue.merge(batch);
+
+    let queue_partition = queue.partition(node.partition());
+
+    use NodeBuilder::{Branch2, Branch3};
+
+    let queue_plan = FlushPlan::new(config, &queue_partition);
+    let batch_plan = queue.flush(&queue_partition, &queue_plan);
 
     if updates.len() <= config.batch_size {
         *branch = BufferNode {
@@ -758,188 +998,6 @@ pub fn update_node(
     }
 
     assert!(queue.len() <= config.batch_size * 2);
-
-    let (builder, new_queue) = {
-        if let Node::Binary {
-            height: _,
-            left,
-            right_min,
-            right,
-        } = node
-        {
-            let left_len = lower_bound_by_key(&updates, &right_min, |update| *update.key());
-            let right_len = updates.len() - left_len;
-
-            assert!(std::cmp::max(left_len, right_len) >= config.batch_size / 2);
-
-            if left_len >= right_len {
-                let new_queue = updates.split_off(std::cmp::min(left_len, config.batch_size));
-                assert!(new_queue.len() <= config.batch_size);
-                assert!(updates.len() >= config.batch_size / 2);
-                assert!(updates.len() <= config.batch_size);
-                (
-                    NodeBuilder::new(left.update(config, updates)).update(
-                        config,
-                        right_min,
-                        Done(right),
-                    ),
-                    new_queue,
-                )
-            } else {
-                let to_flush = updates.split_off(updates.len() - config.batch_size);
-                assert!(updates.len() <= config.batch_size);
-                assert!(to_flush.len() >= config.batch_size / 2);
-                assert!(to_flush.len() <= config.batch_size);
-                (
-                    NodeBuilder::new(Done(left)).update(
-                        config,
-                        right_min,
-                        right.update(config, to_flush),
-                    ),
-                    updates,
-                )
-            }
-        } else if let Node::Ternary {
-            height: _,
-            left,
-            middle_min,
-            middle,
-            right_min,
-            right,
-        } = node
-        {
-            let left_len = lower_bound_by_key(&updates, &middle_min, |update| *update.key());
-            let middle_len =
-                lower_bound_by_key(&&updates[left_len..], &right_min, |update| *update.key());
-            let right_len = updates.len() - (left_len + middle_len);
-
-            assert!(left_len + middle_len <= 2 * config.batch_size);
-            assert!(middle_len + right_len <= 2 * config.batch_size);
-
-            let l_overflow = left_len > config.batch_size;
-            let m_overflow = middle_len > config.batch_size;
-            let r_overflow = right_len > config.batch_size;
-
-            let lm_overflow = left_len + middle_len > config.batch_size;
-            let mr_overflow = middle_len + right_len > config.batch_size;
-
-            // Triggers for `flush left`
-            //
-
-            // Triggers for `flush middle`
-            //
-
-            // Triggers for `flush right`
-            //
-
-            match (l_overflow, m_overflow, r_overflow) {
-                (false, false, false) => {
-                    match (lm_overflow, mr_overflow) {
-                        (false, false) => (
-                            NodeBuilder::Branch3(left, middle_min, middle, right_min, right),
-                            updates,
-                        ),
-                        (true, false) => {
-                            // flush left
-                            // flush middle
-                        }
-                        (false, true) => {
-                            // flush middle
-                            // flush right
-                        }
-                        (true, true) => {
-                            // flush top 2
-                        }
-                    }
-                }
-                (false, true, false) => {
-                    // flush middle
-                }
-                (true, false, false) => {
-                    // flush left
-                    if mr_overflow {
-                        // flush max(middle, right)
-                    }
-                }
-                (false, false, true) => {
-                    if lm_overflow {
-                        // flush max(left, middle)
-                    }
-                    // flush right
-                }
-                (true, true, false) => {
-                    // flush left
-                    // flush middle
-                }
-                (true, false, true) => {
-                    // flush left
-                    // flush right
-                }
-                (false, true, true) => {
-                    // flush middle
-                    // flush right
-                }
-                (true, true, true) => {
-                    panic!("they can't all be overflowing!");
-                }
-            }
-
-            let (builder, middle_flushed) = if left_len + middle_len > config.batch_size {
-                if left_len > middle_len {
-                    let tmp = updates.split_off(left_len);
-                    let left_batch = std::mem::replace(&mut updates, tmp);
-                    left_len -= left_batch.len();
-
-                    assert!(left_batch.len() >= config.batch_size / 2);
-                    assert!(left_batch.len() <= config.batch_size);
-
-                    (NodeBuilder::new(left.update(config, left_batch)), false)
-                } else {
-                    let batch_len = std::cmp::min(middle_len, config.batch_size);
-                    let middle_batch: Vec<Update> =
-                        updates.drain(left_len..(left_len + batch_len)).collect();
-                    middle_len -= batch_len;
-
-                    assert!(middle_batch.len() >= config.batch_size / 2);
-                    assert!(middle_batch.len() <= config.batch_size);
-
-                    (
-                        NodeBuilder::new(Done(left))
-                            .update(middle_min, middle.update(config, middle_batch)),
-                        true,
-                    )
-                }
-            } else {
-                NodeBuilder::new(Done(left))
-            };
-
-            if middle_len + right_len > config.batch_size {
-                if right_len > middle_len {
-                    let right_batch = updates.split_off(left_len + middle_len);
-                //builder.update(right_min
-                } else if !middle_flushed {
-                } else {
-                    (builder, updates)
-                }
-            } else {
-                (builder, updates)
-            }
-
-            let (left_batch, non_left_batch): (Vec<Update>, Vec<Update>) = updates
-                .into_iter()
-                .partition(|update| update.key() < &middle_min);
-
-            let (middle_batch, right_batch): (Vec<Update>, Vec<Update>) = non_left_batch
-                .into_iter()
-                .partition(|update| update.key() < &right_min);
-
-            NodeBuilder::new(left.update(config, left_batch))
-                .update(config, middle_min, middle.update(config, middle_batch))
-                .update(config, right_min, right.update(config, right_batch))
-        } else {
-            panic!("update_node called on non-node: {:?}", node);
-        }
-    };
 
     return match builder {
         Branch1(b0) =>
