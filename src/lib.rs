@@ -105,6 +105,50 @@ impl Viable for Node {
 }
 
 #[derive(Debug)]
+pub struct UpdateBuffer(Vec<Update>);
+
+fn sort_batch(mut batch: Vec<Update>) -> Vec<Update> {
+    batch.sort_by_cached_key(|update| *update.key());
+    batch
+}
+
+impl UpdateBuffer {
+    pub fn new(batch: Vec<Update>) -> Self {
+        Self(sort_batch(batch))
+    }
+    pub fn merge(self, batch: Vec<Update>) -> Self {
+        use itertools::EitherOrBoth::{Both, Left, Right};
+
+        let Self(items) = self;
+        Self(
+            items
+                .into_iter()
+                .merge_join_by(sort_batch(batch).into_iter(), |a, b| a.key().cmp(b.key()))
+                .map(|either| match either {
+                    Left(update) => update,
+                    Right(update) => update,
+                    Both(_, latest) => latest,
+                })
+                .collect(),
+        )
+    }
+}
+
+pub enum NodeBufferView<'buffer> {
+    Binary {
+        buffer: &'buffer UpdateBuffer,
+        left_count: usize,
+        right_count: usize,
+    },
+    Ternary {
+        buffer: &'buffer UpdateBuffer,
+        left_count: usize,
+        middle_count: usize,
+        right_count: usize,
+    },
+}
+
+#[derive(Debug)]
 pub struct BufferNode {
     // The invariant between `queue` and `node`:
     //
@@ -113,44 +157,11 @@ pub struct BufferNode {
     //
     // v = {left, middle_min, middle, right_min, right}
     // q {leftCount + middleCount <= B, middleCount + rightCount <= B}
-    //   leftCount + 2*middleCount + rightCount <= 2*B
     //
-    // This puts an upper bound of (2*B, 3*B) on the size of `queue`.  It also means we
-    // flush to at most 2/3 of the `Subtree`s of a node when we overflow.
-    //
-    // We must always flush exactly `B` updates to maximize efficiency.  This
-    // means we can tighten the bound on the size of `queue` to:
-    //    - 1*B for binary nodes
-    //    - 2*B for ternary nodes
-    //
-    // Proof by induction:
-    //  0 (base) empty queue on v (\nu):
-    //           if b contains B updates for any subtree of v, just pass through.
-    //           otherwise v.queue = b.  b can not contain >=B updates for more than
-    //           one subtree since it only contains B updates overall.  Else case 1.
-    //
-    //  1b (q = {leftCount <= B, rightCount <= B},
-    //      q.len == B):
-    //           (q' = q + b).len == 2*B; there must be some batch b' addressed exclusively
-    //            to one of the two subtrees.  Flush it, and we are back down to q'.len == B,
-    //            with or without a split.  In other words, back to case 1.
-    //
-    //  1t (q = {leftCount <= B, middleCount <= B, rightCount <= B},
-    //      q.len == B):
-    //           (q' = q + b).len == 2*B.  There may or may not be a batch b' (b'.len == B)
-    //            addressed exclusively to one of the three subtrees.  If there is, then
-    //            flush it, bringing (q'' = q' - b').len == B, we are back to case 1.
-    //            If there are two such batches, flush both, back to case 0.  There can't be 3
-    //            since the total q'.len == 2*B.  Else, case 2.
-    //
-    //  2 (q = {leftCount <= B, middleCount <= B, rightCount <= B},
-    //     q.len == 2*B):
-    //           (q' = q + b).len == 3*B.  There may be 2 or 3 batches ready to flush, but
-    //           there can't be more.  If there are 3 batches, then it must be the case that
-    //           all the counts are exactly B (proof by contradiction: suppose otherwise; then
-    //           q'.len must be > 3*B, contradicting the fact that q'.len == 3*B).  Flush
-    //           two out of the three of these.  q''.len == 1*B post-flush; we are back to
-    //           case 1.
+    // When batch-updating:
+    //  - cascade is always B/2 to B
+    //  - at most 1 branch of binary nodes and at most 2 branches of ternary
+    //    nodes cascade: 1/2 to 2/3 of the branches off a node.
     //
     queue: Vec<Update>,
     node: Node,
@@ -709,7 +720,7 @@ impl NodeBuilder {
 pub fn update_node(
     config: &TreeConfig,
     mut branch: Box<BufferNode>,
-    batch: Vec<Update>,
+    mut batch: Vec<Update>,
 ) -> UpdateResult {
     use NodeBuilder::*;
     use Orphan::Child;
@@ -724,7 +735,11 @@ pub fn update_node(
 
     use itertools::EitherOrBoth::{Both, Left, Right};
 
-    let updates: Vec<Update> = queue
+    assert!(queue.len() <= config.batch_size);
+
+    batch.sort_by_cached_key(|update| *update.key());
+
+    let mut updates: Vec<Update> = queue
         .into_iter()
         .merge_join_by(batch.into_iter(), |a, b| a.key().cmp(b.key()))
         .map(|either| match either {
@@ -734,7 +749,17 @@ pub fn update_node(
         })
         .collect();
 
-    let builder = {
+    if updates.len() <= config.batch_size {
+        *branch = BufferNode {
+            queue: updates,
+            node,
+        };
+        return Done(Subtree::Branch(branch));
+    }
+
+    assert!(queue.len() <= config.batch_size * 2);
+
+    let (builder, new_queue) = {
         if let Node::Binary {
             height: _,
             left,
@@ -742,21 +767,38 @@ pub fn update_node(
             right,
         } = node
         {
-            // TODO:
-            //  merge `batch` and `queue`.
-            //  if the result is >= batch_size, then split the merged queue
-            //    and send `batch_size` updates to _either_ `left` or `right`.
-            let right_batch_min = lower_bound_by_key(&updates, &right_min, |update| *update.key());
+            let left_len = lower_bound_by_key(&updates, &right_min, |update| *update.key());
+            let right_len = updates.len() - left_len;
 
-            let (left_batch, right_batch): (Vec<Update>, Vec<Update>) = updates
-                .into_iter()
-                .partition(|update| update.key() < &right_min);
+            assert!(std::cmp::max(left_len, right_len) >= config.batch_size / 2);
 
-            NodeBuilder::new(left.update(config, left_batch)).update(
-                config,
-                right_min,
-                right.update(config, right_batch),
-            )
+            if left_len >= right_len {
+                let new_queue = updates.split_off(std::cmp::min(left_len, config.batch_size));
+                assert!(new_queue.len() <= config.batch_size);
+                assert!(updates.len() >= config.batch_size / 2);
+                assert!(updates.len() <= config.batch_size);
+                (
+                    NodeBuilder::new(left.update(config, updates)).update(
+                        config,
+                        right_min,
+                        Done(right),
+                    ),
+                    new_queue,
+                )
+            } else {
+                let to_flush = updates.split_off(updates.len() - config.batch_size);
+                assert!(updates.len() <= config.batch_size);
+                assert!(to_flush.len() >= config.batch_size / 2);
+                assert!(to_flush.len() <= config.batch_size);
+                (
+                    NodeBuilder::new(Done(left)).update(
+                        config,
+                        right_min,
+                        right.update(config, to_flush),
+                    ),
+                    updates,
+                )
+            }
         } else if let Node::Ternary {
             height: _,
             left,
@@ -766,12 +808,122 @@ pub fn update_node(
             right,
         } = node
         {
-            let middle_batch_min =
-                lower_bound_by_key(&updates, &middle_min, |update| *update.key());
-            let right_batch_min =
-                lower_bound_by_key(&&updates[middle_batch_min..], &right_min, |update| {
-                    *update.key()
-                });
+            let left_len = lower_bound_by_key(&updates, &middle_min, |update| *update.key());
+            let middle_len =
+                lower_bound_by_key(&&updates[left_len..], &right_min, |update| *update.key());
+            let right_len = updates.len() - (left_len + middle_len);
+
+            assert!(left_len + middle_len <= 2 * config.batch_size);
+            assert!(middle_len + right_len <= 2 * config.batch_size);
+
+            let l_overflow = left_len > config.batch_size;
+            let m_overflow = middle_len > config.batch_size;
+            let r_overflow = right_len > config.batch_size;
+
+            let lm_overflow = left_len + middle_len > config.batch_size;
+            let mr_overflow = middle_len + right_len > config.batch_size;
+
+            // Triggers for `flush left`
+            //
+
+            // Triggers for `flush middle`
+            //
+
+            // Triggers for `flush right`
+            //
+
+            match (l_overflow, m_overflow, r_overflow) {
+                (false, false, false) => {
+                    match (lm_overflow, mr_overflow) {
+                        (false, false) => (
+                            NodeBuilder::Branch3(left, middle_min, middle, right_min, right),
+                            updates,
+                        ),
+                        (true, false) => {
+                            // flush left
+                            // flush middle
+                        }
+                        (false, true) => {
+                            // flush middle
+                            // flush right
+                        }
+                        (true, true) => {
+                            // flush top 2
+                        }
+                    }
+                }
+                (false, true, false) => {
+                    // flush middle
+                }
+                (true, false, false) => {
+                    // flush left
+                    if mr_overflow {
+                        // flush max(middle, right)
+                    }
+                }
+                (false, false, true) => {
+                    if lm_overflow {
+                        // flush max(left, middle)
+                    }
+                    // flush right
+                }
+                (true, true, false) => {
+                    // flush left
+                    // flush middle
+                }
+                (true, false, true) => {
+                    // flush left
+                    // flush right
+                }
+                (false, true, true) => {
+                    // flush middle
+                    // flush right
+                }
+                (true, true, true) => {
+                    panic!("they can't all be overflowing!");
+                }
+            }
+
+            let (builder, middle_flushed) = if left_len + middle_len > config.batch_size {
+                if left_len > middle_len {
+                    let tmp = updates.split_off(left_len);
+                    let left_batch = std::mem::replace(&mut updates, tmp);
+                    left_len -= left_batch.len();
+
+                    assert!(left_batch.len() >= config.batch_size / 2);
+                    assert!(left_batch.len() <= config.batch_size);
+
+                    (NodeBuilder::new(left.update(config, left_batch)), false)
+                } else {
+                    let batch_len = std::cmp::min(middle_len, config.batch_size);
+                    let middle_batch: Vec<Update> =
+                        updates.drain(left_len..(left_len + batch_len)).collect();
+                    middle_len -= batch_len;
+
+                    assert!(middle_batch.len() >= config.batch_size / 2);
+                    assert!(middle_batch.len() <= config.batch_size);
+
+                    (
+                        NodeBuilder::new(Done(left))
+                            .update(middle_min, middle.update(config, middle_batch)),
+                        true,
+                    )
+                }
+            } else {
+                NodeBuilder::new(Done(left))
+            };
+
+            if middle_len + right_len > config.batch_size {
+                if right_len > middle_len {
+                    let right_batch = updates.split_off(left_len + middle_len);
+                //builder.update(right_min
+                } else if !middle_flushed {
+                } else {
+                    (builder, updates)
+                }
+            } else {
+                (builder, updates)
+            }
 
             let (left_batch, non_left_batch): (Vec<Update>, Vec<Update>) = updates
                 .into_iter()
@@ -808,8 +960,9 @@ pub fn update_node(
         Branch2(b0, m1, b1) => {
             assert!(b0.is_viable(config));
             assert!(b1.is_viable(config));
+            assert!(new_queue.len() <= config.batch_size);
 
-            *branch = make_buffer_node![Vec::new(), b0, m1, b1];
+            *branch = make_buffer_node![new_queue, b0, m1, b1];
             Done(Branch(branch))
         }
         Branch3(b0, m1, b1, m2, b2) => {
@@ -817,7 +970,7 @@ pub fn update_node(
             assert!(b1.is_viable(config));
             assert!(b2.is_viable(config));
 
-            *branch = make_buffer_node![Vec::new(), b0, m1, b1, m2, b2];
+            *branch = make_buffer_node![new_queue, b0, m1, b1, m2, b2];
             Done(Branch(branch))
         }
         Branch4(b0, m1, b1, m2, b2, m3, b3) => {
