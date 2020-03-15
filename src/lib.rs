@@ -322,67 +322,40 @@ impl FlushPlan<usize> {
                 let total = len0 + len1 + len2;
                 let (pair0, pair1) = (len0 + len1, len1 + len2);
 
-                //                assert!(total <= config.batch_size * 2);
                 assert!(*len0 <= config.batch_size * 2);
                 assert!(*len1 <= config.batch_size * 2);
                 assert!(*len2 <= config.batch_size * 2);
 
-                let good3 = |new_total, new_pair0, new_pair1| -> bool {
-                    new_total <= config.batch_size * 2
-                        && new_pair0 <= config.batch_size
-                        && new_pair1 <= config.batch_size
-                };
-                let good2 = |new_total, new_pair0, new_pair1| -> bool {
-                    new_total <= config.batch_size
-                        && new_pair0 <= config.batch_size
-                        && new_pair1 <= config.batch_size
-                };
-
-                let (batch0, batch1, batch2) =
-                    (take_batch(*len0), take_batch(*len1), take_batch(*len2));
-
-                if good3(total, pair0, pair1) {
-                    if batch0 != 0 {
-                        if batch1 != 0 {
-                            FlushLeftMiddle(batch0, batch1)
-                        } else if batch2 != 0 {
-                            FlushLeftRight(batch0, batch2)
-                        } else {
-                            FlushLeft(batch0)
-                        }
-                    } else if batch1 != 0 {
-                        if batch2 != 0 {
-                            FlushMiddleRight(batch1, batch2)
-                        } else {
-                            FlushMiddle(batch1)
-                        }
-                    } else if batch2 != 0 {
-                        FlushRight(batch2)
-                    } else {
-                        NoFlush
-                    }
-                } else if good2(total - batch1, pair0 - batch1, pair1 - batch1) {
-                    FlushMiddle(batch1)
-                } else if good2(total - batch0, pair0 - batch0, pair1) {
-                    FlushLeft(batch0)
-                } else if good2(total - batch2, pair0, pair1 - batch2) {
-                    FlushRight(batch2)
-                } else if good2(
-                    total - (batch0 + batch1),
-                    pair0 - (batch0 + batch1),
-                    pair1 - batch1,
-                ) {
-                    FlushLeftMiddle(batch0, batch1)
-                } else if good2(
-                    total - (batch1 + batch2),
-                    pair0 - batch1,
-                    pair1 - (batch1 + batch2),
-                ) {
-                    FlushMiddleRight(batch1, batch2)
-                } else if good2(total - (batch0 + batch2), pair0 - batch0, pair1 - batch2) {
-                    FlushLeftRight(batch0, batch2)
+                if total <= config.batch_size {
+                    NoFlush
                 } else {
-                    panic!("no good plans!  {:?}, config={:?}", part, config);
+                    let (batch0, batch1, batch2) =
+                        (take_batch(*len0), take_batch(*len1), take_batch(*len2));
+
+                    match (batch0 != 0, batch1 != 0, batch2 != 0) {
+                        (false, false, false) => NoFlush,
+                        (true, false, false) => FlushLeft(batch0),
+                        (false, true, false) => FlushMiddle(batch1),
+                        (false, false, true) => FlushRight(batch2),
+                        (true, true, false) => FlushLeftMiddle(batch0, batch1),
+                        (true, false, true) => FlushLeftRight(batch0, batch2),
+                        (false, true, true) => FlushMiddleRight(batch1, batch2),
+                        (true, true, true) => {
+                            if batch0 < batch1 {
+                                if batch0 < batch2 {
+                                    FlushMiddleRight(batch1, batch2)
+                                } else {
+                                    FlushLeftMiddle(batch0, batch1)
+                                }
+                            } else {
+                                if batch1 < batch2 {
+                                    FlushLeftRight(batch0, batch2)
+                                } else {
+                                    FlushLeftMiddle(batch0, batch1)
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -642,8 +615,7 @@ impl Update {
 pub enum UpdateResult {
     Done(Subtree),
     Split(Subtree, i32, Subtree),
-    Merge(Orphan),     // child-level
-    DeepMerge(Orphan), // grandchild-level
+    Merge(u16, Orphan),
 }
 
 impl Split for UpdateResult {
@@ -726,21 +698,38 @@ pub fn fuse_vals(mut v0: Vec<i32>, mut v1: Vec<i32>) -> Vec<i32> {
     v0
 }
 
-pub fn fuse_orphans(config: &TreeConfig, left: Orphan, right_min: i32, right: Orphan) -> Subtree {
+pub enum FuseResult {
+    Done(Subtree),
+    Merge(Orphan),
+}
+
+pub fn fuse_orphans(
+    config: &TreeConfig,
+    left: Orphan,
+    right_min: i32,
+    right: Orphan,
+) -> FuseResult {
+    use FuseResult::{Done, Merge};
     use Orphan::{Child, Items};
 
     match (left, right) {
         (Items(left_vals), Items(mut right_vals)) => {
-            assert!(left_vals.len() + right_vals.len() >= config.batch_size);
             assert!(left_vals.len() + right_vals.len() <= config.batch_size * 2);
 
-            Subtree::Leaf {
-                vals: fuse_vals(left_vals, right_vals),
+            if left_vals.len() + right_vals.len() < config.batch_size {
+                Merge(Items(fuse_vals(left_vals, right_vals)))
+            } else {
+                Done(Subtree::Leaf {
+                    vals: fuse_vals(left_vals, right_vals),
+                })
             }
         }
-        (Child(left_subtree), Child(right_subtree)) => {
-            make_branch![Queue::new(), left_subtree, right_min, right_subtree]
-        }
+        (Child(left_subtree), Child(right_subtree)) => Done(make_branch![
+            Queue::new(),
+            left_subtree,
+            right_min,
+            right_subtree
+        ]),
         _ => {
             panic!("fuse must be called on like items.");
         }
@@ -1132,7 +1121,7 @@ pub fn update_leaf(config: &TreeConfig, batch: Vec<Update>, vals: Vec<i32>) -> U
     assert!(merged.len() <= config.batch_size * 3);
 
     if merged.len() < config.batch_size {
-        return UpdateResult::Merge(Orphan::Items(merged));
+        return UpdateResult::Merge(0, Orphan::Items(merged));
     }
 
     maybe_split_leaf(config, merged)
@@ -1152,8 +1141,7 @@ pub fn maybe_split_leaf<Result: Split + Done>(config: &TreeConfig, mut vals: Vec
 
 #[derive(Debug)]
 enum NodeBuilder {
-    MergeLeft(Orphan),
-    DeepMergeLeft(Orphan),
+    MergeLeft(u16, Orphan),
     Branch1(Subtree),
     Branch2(Subtree, i32, Subtree),
     Branch3(Subtree, i32, Subtree, i32, Subtree),
@@ -1192,23 +1180,15 @@ impl NodeBuilder {
         match first {
             Done(b0) => Branch1(b0),
             Split(b0, m1, b1) => Branch2(b0, m1, b1),
-            Merge(orphan) => MergeLeft(orphan),
-            DeepMerge(orphan) => DeepMergeLeft(orphan),
+            Merge(depth, orphan) => MergeLeft(depth, orphan),
         }
     }
     fn update(self, config: &TreeConfig, next_min: i32, next: UpdateResult) -> Self {
         use NodeBuilder::*;
         use Orphan::{Child, Items};
-        use UpdateResult::*;
+        use UpdateResult::{Done, Merge, Split};
 
         match (self, next_min, next) {
-            // Fuse case - 0 => 0,1
-            //
-            (MergeLeft(o0), m1, Merge(o1)) => Branch1(fuse_orphans(config, o0, m1, o1)),
-            (DeepMergeLeft(oo0), m1, DeepMerge(oo1)) => {
-                MergeLeft(Child(fuse_orphans(config, oo0, m1, oo1)))
-            }
-
             // Done cases - grow by 1
             //
             (Branch1(b0), m1, Done(b1)) => Branch2(b0, m1, b1),
@@ -1234,36 +1214,59 @@ impl NodeBuilder {
 
             // Merge cases - grow by 0 or 1
             //
-            (MergeLeft(o0), m0, Done(b0)) => match b0.merge_left(config, o0, m0) {
+            (MergeLeft(depth, o0), m1, Merge(depth, o1)) => {
+                match fuse_orphans(config, o0, m1, o1) {
+                    FuseResult::Done(b0) => {
+                        if depth > 0 {
+                            MergeLeft(depth - 1, Child(b0))
+                        } else {
+                            Branch1(b0)
+                        }
+                    }
+                    FuseResult::Merge(o0) => MergeLeft(depth, o0),
+                }
+            }
+            (MergeLeft(d0, o0), m1, Merge(d1, Child(o1))) if d1 < d0 => {
+                match o1.merge_left(config, d0 - d1, o0, m1) {
+                    MergeResult::Done(o1) => 
+                }
+            }
+            (MergeLeft(depth, o0), m0, Done(b0)) => match b0.merge_left(config, depth, o0, m0) {
                 MergeResult::Done(b0) => Branch1(b0),
                 MergeResult::Split(b0, m1, b1) => Branch2(b0, m1, b1),
             },
-            (MergeLeft(o0), m0, Split(b0, m2, b2)) => match b0.merge_left(config, o0, m0) {
-                MergeResult::Done(b0) => Branch2(b0, m2, b2),
-                MergeResult::Split(b0, m1, b1) => Branch3(b0, m1, b1, m2, b2),
-            },
-            (Branch1(b0), m1, Merge(orphan)) => match b0.merge_right(config, m1, orphan) {
-                MergeResult::Done(b0) => Branch1(b0),
-                MergeResult::Split(b0, m1, b1) => Branch2(b0, m1, b1),
-            },
-            (Branch2(b0, m1, b1), m2, Merge(orphan)) => match b1.merge_right(config, m2, orphan) {
-                MergeResult::Done(b1) => Branch2(b0, m1, b1),
-                MergeResult::Split(b1, m2, b2) => Branch3(b0, m1, b1, m2, b2),
-            },
-            (Branch3(b0, m1, b1, m2, b2), m3, Merge(orphan)) => {
-                match b2.merge_right(config, m3, orphan) {
+            (MergeLeft(depth, o0), m0, Split(b0, m2, b2)) => {
+                match b0.merge_left(config, depth, o0, m0) {
+                    MergeResult::Done(b0) => Branch2(b0, m2, b2),
+                    MergeResult::Split(b0, m1, b1) => Branch3(b0, m1, b1, m2, b2),
+                }
+            }
+            (Branch1(b0), m1, Merge(depth, orphan)) => {
+                match b0.merge_right(config, depth, m1, orphan) {
+                    MergeResult::Done(b0) => Branch1(b0),
+                    MergeResult::Split(b0, m1, b1) => Branch2(b0, m1, b1),
+                }
+            }
+            (Branch2(b0, m1, b1), m2, Merge(depth, orphan)) => {
+                match b1.merge_right(config, depth, m2, orphan) {
+                    MergeResult::Done(b1) => Branch2(b0, m1, b1),
+                    MergeResult::Split(b1, m2, b2) => Branch3(b0, m1, b1, m2, b2),
+                }
+            }
+            (Branch3(b0, m1, b1, m2, b2), m3, Merge(depth, orphan)) => {
+                match b2.merge_right(config, depth, m3, orphan) {
                     MergeResult::Done(b2) => Branch3(b0, m1, b1, m2, b2),
                     MergeResult::Split(b2, m3, b3) => Branch4(b0, m1, b1, m2, b2, m3, b3),
                 }
             }
-            (Branch4(b0, m1, b1, m2, b2, m3, b3), m4, Merge(orphan)) => {
-                match b3.merge_right(config, m4, orphan) {
+            (Branch4(b0, m1, b1, m2, b2, m3, b3), m4, Merge(depth, orphan)) => {
+                match b3.merge_right(config, depth, m4, orphan) {
                     MergeResult::Done(b3) => Branch4(b0, m1, b1, m2, b2, m3, b3),
                     MergeResult::Split(b3, m4, b4) => Branch5(b0, m1, b1, m2, b2, m3, b3, m4, b4),
                 }
             }
-            (Branch5(b0, m1, b1, m2, b2, m3, b3, m4, b4), m5, Merge(orphan)) => {
-                match b4.merge_right(config, m5, orphan) {
+            (Branch5(b0, m1, b1, m2, b2, m3, b3, m4, b4), m5, Merge(depth, orphan)) => {
+                match b4.merge_right(config, depth, m5, orphan) {
                     MergeResult::Done(b4) => Branch5(b0, m1, b1, m2, b2, m3, b3, m4, b4),
                     MergeResult::Split(b4, m5, b5) => {
                         Branch6(b0, m1, b1, m2, b2, m3, b3, m4, b4, m5, b5)
@@ -1275,20 +1278,13 @@ impl NodeBuilder {
 
             // Deep Merge cases
             //
-            (DeepMergeLeft(oo0), m0, Done(b0)) => match b0.deep_merge_left(config, oo0, m0) {
-                MergeResult::Done(b0) => Branch1(b0),
-                MergeResult::Split(b0, m1, b1) => Branch2(b0, m1, b1),
-            },
-            (DeepMergeLeft(oo0), m1, Split(b1, m2, b2)) => {
-                match b1.deep_merge_left(config, oo0, m1) {
-                    MergeResult::Done(b1) => Branch2(b1, m2, b2),
-                    MergeResult::Split(b0, m1, b1) => Branch3(b0, m1, b1, m2, b2),
-                }
-            }
             (DeepMergeLeft(oo0), m1, Merge(Child(o1))) => match o1.merge_left(config, oo0, m1) {
                 MergeResult::Done(o1) => MergeLeft(Child(o1)),
                 MergeResult::Split(o1, m2, o2) => {
-                    Branch1(fuse_orphans(config, Child(o1), m2, Child(o2)))
+                    match fuse_orphans(config, Child(o1), m2, Child(o2)) {
+                        FuseResult::Done(b0) => Branch1(b0),
+                        FuseResult::Merge(o1) => MergeLeft(o1),
+                    }
                 }
             },
             (MergeLeft(Items(_)), _, DeepMerge(_)) => {
@@ -1300,38 +1296,12 @@ impl NodeBuilder {
             (MergeLeft(Child(o0)), m1, DeepMerge(oo1)) => match o0.merge_right(config, m1, oo1) {
                 MergeResult::Done(o0) => MergeLeft(Child(o0)),
                 MergeResult::Split(o0, m1, o1) => {
-                    Branch1(fuse_orphans(config, Child(o0), m1, Child(o1)))
-                }
-            },
-            (Branch1(b0), m1, DeepMerge(oo1)) => match b0.deep_merge_right(config, m1, oo1) {
-                MergeResult::Done(b0) => Branch1(b0),
-                MergeResult::Split(b0, m1, b1) => Branch2(b0, m1, b1),
-            },
-            (Branch2(b0, m1, b1), m2, DeepMerge(oo2)) => match b1.deep_merge_right(config, m2, oo2)
-            {
-                MergeResult::Done(b1) => Branch2(b0, m1, b1),
-                MergeResult::Split(b1, m2, b2) => Branch3(b0, m1, b1, m2, b2),
-            },
-            (Branch3(b0, m1, b1, m2, b2), m3, DeepMerge(oo3)) => {
-                match b2.deep_merge_right(config, m3, oo3) {
-                    MergeResult::Done(b2) => Branch3(b0, m1, b1, m2, b2),
-                    MergeResult::Split(b2, m3, b3) => Branch4(b0, m1, b1, m2, b2, m3, b3),
-                }
-            }
-            (Branch4(b0, m1, b1, m2, b2, m3, b3), m4, DeepMerge(oo4)) => {
-                match b3.deep_merge_right(config, m4, oo4) {
-                    MergeResult::Done(b3) => Branch4(b0, m1, b1, m2, b2, m3, b3),
-                    MergeResult::Split(b3, m4, b4) => Branch5(b0, m1, b1, m2, b2, m3, b3, m4, b4),
-                }
-            }
-            (Branch5(b0, m1, b1, m2, b2, m3, b3, m4, b4), m5, DeepMerge(oo5)) => {
-                match b4.deep_merge_right(config, m5, oo5) {
-                    MergeResult::Done(b4) => Branch5(b0, m1, b1, m2, b2, m3, b3, m4, b4),
-                    MergeResult::Split(b4, m5, b5) => {
-                        Branch6(b0, m1, b1, m2, b2, m3, b3, m4, b4, m5, b5)
+                    match fuse_orphans(config, Child(o0), m1, Child(o1)) {
+                        FuseResult::Done(b0) => Branch1(b0),
+                        FuseResult::Merge(o0) => MergeLeft(o0),
                     }
                 }
-            }
+            },
         }
     }
 
@@ -1379,33 +1349,20 @@ pub fn update_node(
     assert!(!node.is_ternary() || queue.len() <= config.batch_size * 3 / 2);
 
     let mut queue = queue.merge(batch);
+
     let queue_partition = queue.partition(node.partition());
-    let queue_parts_debug = format!("{:?}", queue_partition);
+    //let queue_parts_debug = format!("{:?}", queue_partition);
     let queue_plan = FlushPlan::new(config, &queue_partition);
-    let queue_plan_debug = format!("{:?}", queue_plan);
+    //let queue_plan_debug = format!("{:?}", queue_plan);
     let batch_plan = queue.flush(config, &queue_partition, &queue_plan);
     let builder = node.flush(config, batch_plan);
 
     return match builder {
         MergeLeft(o0) => DeepMerge(o0),
-        Branch1(b0) =>
-        //
-        // TODO - Before we return in this case, send any remaining queued updates down to `b0`.
-        //   This is needed because there is no affordance for bubbling unflushed queued updates
-        //   on a merge, which in turn is because the merge operations must be O(1) to achieve
-        //   our overall algorithmic complexity aim.  It is safe/correct to do this because:
-        //     1. Any remaining `queue` updates must be <= batch_size in number.  This is because
-        //        we can only trigger a merge if the node was binary when `update_node` was called.
-        //        (TODO: it would be great to hint/guarantee this more strongly using types)
-        //     2. If we are down to one child branch at this point, then by definition its bounding
-        //        key range has expanded to fill the entire range of its parent; there is no other
-        //        Subtree that can 'claim' ownership of the key range of the defunct sibling of `b0`.
-        {
+        Branch1(b0) => {
             if queue.len() == 0 {
                 Merge(Child(b0))
             } else {
-                //let b0_debug = format!("{:?}", b0);
-                //let q_debug = format!("{:?}", queue);
                 match b0.update(config, queue.consume()) {
                     Done(b0) => Merge(Child(b0)),
                     Split(b0, m1, b1) => {
@@ -1425,13 +1382,13 @@ pub fn update_node(
             assert!(b1.is_viable(config));
             assert!(
                 queue.len() <= config.batch_size,
-                "queue is too long!\n  queue.len()={}\n  b0={:#?}\n  b1={:#?}\n  queue={:?}, plan={:?}, parts={:?}",
+                "queue is too long!\n  queue.len()={}\n  b0={:#?}\n  b1={:#?}\n  queue={:?},", // plan={:?}, parts={:?}",
                 queue.len(),
                 b0,
                 b1,
                 queue,
-                queue_plan_debug,
-                queue_parts_debug
+                //queue_plan_debug,
+                //queue_parts_debug
             );
 
             *branch = make_buffer_node![queue, b0, m1, b1];
@@ -1443,13 +1400,13 @@ pub fn update_node(
             assert!(b2.is_viable(config));
             assert!(
                 queue.len() <= config.batch_size * 3 / 2,
-                "queue is too long!\n  queue.len()={}\n  b0={:#?}\n  b1={:#?}\n  b2={:#?}\n  queue={:?}, plan={:?}, parts={:?}",
+                "queue is too long!\n  queue.len()={}\n  b0={:#?}\n  b1={:#?}\n  b2={:#?}\n  queue={:?},",// plan={:?}, parts={:?}",
                 queue.len(),
                 b0,
                 b1,b2,
                 queue,
-                queue_plan_debug,
-                queue_parts_debug
+                //queue_plan_debug,
+                //queue_parts_debug
             );
 
             *branch = make_buffer_node![queue, b0, m1, b1, m2, b2];
@@ -1638,7 +1595,7 @@ mod tests {
         use rand::prelude::*;
 
         let mut rng = rand::thread_rng();
-        for n in 0..100 {
+        for n in 0..1000 {
             let mut x: Vec<Update> = (0..1024).map(Update::Put).collect();
             let mut y: Vec<Update> = Vec::new();
 
