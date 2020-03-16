@@ -8,7 +8,7 @@ use itertools::Itertools;
 #[derive(Debug)]
 pub struct Queue(Vec<Update>);
 
-fn sort_batch(mut batch: Vec<Update>) -> Vec<Update> {
+pub fn sort_batch(mut batch: Vec<Update>) -> Vec<Update> {
     batch.sort_by_cached_key(|update| *update.key());
     batch
 }
@@ -57,7 +57,7 @@ impl Queue {
             Result::Err(_) => None,
         }
     }
-    pub fn partition(&self, pivots: &Node<(), K>) -> Node<usize, K> {
+    pub fn partition<U>(&self, pivots: &Node<U, K>) -> Node<usize, K> {
         let Self(ref queue) = self;
 
         match pivots {
@@ -82,11 +82,10 @@ impl Queue {
         (Self(queue), Self(split))
     }
 
-    fn flush(
+    pub fn flush(
         &mut self,
-        config: &TreeConfig,
         partition: &Node<usize, K>,
-        plan: &Node<usize, ()>,
+        plan: &Node<Option<usize>, ()>,
     ) -> Node<Option<Vec<Update>>, ()> {
         use Node::*;
 
@@ -95,12 +94,12 @@ impl Queue {
         match (partition, plan) {
             // no flush
             //
-            (_, Binary(0, _, 0)) => Binary(None, (), None),
-            (_, Ternary(0, _, 0, _, 0)) => Ternary(None, (), None, (), None),
+            (_, Binary(None, _, None)) => Binary(None, (), None),
+            (_, Ternary(None, _, None, _, None)) => Ternary(None, (), None, (), None),
 
             // flush left
             //
-            (_, Binary(y, _, 0)) | (_, Ternary(y, _, 0, _, 0)) if *y != 0 => {
+            (_, Binary(Some(y), _, None)) | (_, Ternary(Some(y), _, None, _, None)) => {
                 let new_queue = queue.split_off(*y);
                 let Queue(batch) = std::mem::replace(self, Queue(new_queue));
                 match plan {
@@ -111,7 +110,7 @@ impl Queue {
 
             // flush right
             //
-            (_, Binary(0, _, y)) | (_, Ternary(0, _, 0, _, y)) if *y != 0 => {
+            (_, Binary(None, _, Some(y))) | (_, Ternary(None, _, None, _, Some(y))) => {
                 let batch = queue.split_off(queue.len() - y);
                 match plan {
                     Binary(..) => Binary(None, (), Some(batch)),
@@ -123,14 +122,14 @@ impl Queue {
 
             // flush middle
             //
-            (Ternary(n0, _, n1, _, n2), Ternary(0, _, y1, _, 0)) if *y1 != 0 => {
+            (Ternary(n0, _, n1, _, n2), Ternary(None, _, Some(y1), _, None)) => {
                 let batch = queue.drain(*n0..(n0 + y1)).collect();
                 Ternary(None, (), Some(batch), (), None)
             }
 
             // flush left, middle
             //
-            (Ternary(n0, _, n1, _, n2), Ternary(y0, _, y1, _, 0)) if *y0 != 0 && *y1 != 0 => {
+            (Ternary(n0, _, n1, _, n2), Ternary(Some(y0), _, Some(y1), _, None)) => {
                 let mut batch0: Vec<Update> = queue.drain((n0 - y0)..(n0 + y1)).collect();
                 let batch1 = batch0.split_off(*y0);
                 Ternary(Some(batch0), (), Some(batch1), (), None)
@@ -138,7 +137,7 @@ impl Queue {
 
             // flush left, right
             //
-            (Ternary(n0, _, n1, _, n2), Ternary(y0, _, 0, _, y2)) if *y0 != 0 && *y2 != 0 => {
+            (Ternary(n0, _, n1, _, n2), Ternary(Some(y0), _, None, _, Some(y2))) => {
                 let new_queue = queue.split_off(*y0);
                 let batch0 = std::mem::replace(queue, new_queue);
                 let batch2 = queue.split_off(queue.len() - *y2);
@@ -147,7 +146,7 @@ impl Queue {
 
             // flush middle, right
             //
-            (Ternary(n0, _, n1, _, n2), Ternary(0, _, y1, _, y2)) if *y1 != 0 && *y2 != 0 => {
+            (Ternary(n0, _, n1, _, n2), Ternary(None, _, Some(y1), _, Some(y2))) => {
                 let mut batch1: Vec<Update> =
                     queue.drain(((n0 + n1) - y1)..((n0 + n1) + y2)).collect();
                 let batch2 = batch1.split_off(*y1);
@@ -155,6 +154,54 @@ impl Queue {
             }
 
             _ => panic!("partition/plan mismatch"),
+        }
+    }
+}
+
+pub fn plan_flush<T>(config: &TreeConfig, partition: &Node<usize, T>) -> Node<Option<usize>, ()> {
+    let take_batch = |n: usize| {
+        if n < config.batch_size / 2 {
+            None
+        } else if n > config.batch_size {
+            Some(config.batch_size)
+        } else {
+            Some(n)
+        }
+    };
+
+    match partition {
+        Node::Binary(n0, _, n1) => {
+            assert!(n0 + n1 <= 2 * config.batch_size);
+
+            if n0 + n1 <= config.batch_size {
+                Node::Binary(None, (), None)
+            } else {
+                if n0 >= n1 {
+                    Node::Binary(take_batch(*n0), (), None)
+                } else {
+                    Node::Binary(None, (), take_batch(*n1))
+                }
+            }
+        }
+        Node::Ternary(n0, _, n1, _, n2) => {
+            let total = n0 + n1 + n2;
+
+            if total <= config.batch_size * 3 / 2 {
+                Node::Ternary(None, (), None, (), None)
+            } else {
+                match (take_batch(*n0), take_batch(*n1), take_batch(*n2)) {
+                    (Some(y0), Some(y1), Some(y2)) => {
+                        if y0 <= y1 && y0 <= y2 {
+                            Node::Ternary(None, (), Some(y1), (), Some(y2))
+                        } else if y1 <= y0 && y1 <= y2 {
+                            Node::Ternary(Some(y0), (), None, (), Some(y2))
+                        } else {
+                            Node::Ternary(Some(y0), (), Some(y1), (), None)
+                        }
+                    }
+                    (b0, b1, b2) => Node::Ternary(b0, (), b1, (), b2),
+                }
+            }
         }
     }
 }

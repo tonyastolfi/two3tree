@@ -1,3 +1,4 @@
+#[derive(Debug)]
 pub enum Node<B, P> {
     Binary(B, P, B),
     Ternary(B, P, B, P, B),
