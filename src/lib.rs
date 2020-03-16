@@ -43,6 +43,36 @@ pub struct Tree {
     root: Subtree,
 }
 
+macro_rules! make_tree {
+    ($branch: expr, $h:expr, $b0:expr, $m1:expr, $b1:expr, $m2:expr, $b2:expr) => {{
+        *$branch = Node::Ternary($b0, $m1, $b1, $m2, $b2);
+        Tree {
+            height: $h,
+            root: Subtree::Branch($branch),
+        }
+    }};
+    ($branch: expr, $h:expr, $b0:expr, $m1:expr, $b1:expr, $m2:expr, $b2:expr, $m3:expr, $b3:expr) => {{
+        *$branch = Node::Binary($b0, $m1, $b1);
+        Tree {
+            height: $h + 1,
+            root: Subtree::Branch(Box::new(Node::Binary(
+                Subtree::Branch($branch),
+                $m2,
+                Subtree::Branch(Box::new(Node::Binary($b2, $m3, $b3))),
+            ))),
+        }
+    }};
+}
+
+macro_rules! update_branch {
+    ($branch:expr, $b0:expr, $m1:expr, $b1:expr) => {
+        Subtree::Branch({
+            *$branch = Node::Binary($b0, $m1, $b1);
+            $branch
+        })
+    };
+}
+
 impl Tree {
     pub fn new() -> Self {
         Self {
@@ -86,13 +116,97 @@ impl Tree {
                 };
             }
 
-            // TODO :
             //  (h + 1, h) -> destructure self, merge other as right child
+            //
+            (h, other_h) if h == other_h + 1 => match self.root {
+                Subtree::Branch(mut branch) => match (*branch, other_min, other.root) {
+                    (Node::Binary(b0, m1, b1), m2, b2) => {
+                        return make_tree!(branch, h, b0, m1, b1, m2, b2);
+                    }
+                    (Node::Ternary(b0, m1, b1, m2, b2), m3, b3) => {
+                        return make_tree!(branch, h, b0, m1, b1, m2, b2, m3, b3);
+                    }
+                },
+                _ => panic!("self.root is leaf, but self.height > 0!"),
+            },
+
             //  (h, h + 1) -> destructure other, merge self as left child
+            (self_h, h) if self_h + 1 == h => match other.root {
+                Subtree::Branch(mut branch) => match (self.root, other_min, *branch) {
+                    (b0, m1, Node::Binary(b1, m2, b2)) => {
+                        return make_tree!(branch, h, b0, m1, b1, m2, b2);
+                    }
+                    (b0, m1, Node::Ternary(b1, m2, b2, m3, b3)) => {
+                        return make_tree!(branch, h, b0, m1, b1, m2, b2, m3, b3);
+                    }
+                },
+                _ => panic!("other.root is leaf, but other.height > 0!"),
+            },
+
             //  (h + d, h), d > 1  -> recursive case
+            //
+            (h, other_h) if h > other_h + 1 => match self.root {
+                Subtree::Branch(mut branch) => match *branch {
+                    Node::Binary(b0, m1, b1) => {
+                        let initial = Tree {
+                            height: h - 1,
+                            root: b0,
+                        };
+                        let last = Tree {
+                            height: h - 1,
+                            root: b1,
+                        };
+                        return initial.join(config, m1, last.join(config, other_min, other));
+                    }
+                    Node::Ternary(b0, m1, b1, m2, b2) => {
+                        let initial = Tree {
+                            height: h,
+                            root: update_branch!(branch, b0, m1, b1),
+                        };
+                        let last = Tree {
+                            height: h - 1,
+                            root: b2,
+                        };
+                        return initial.join(config, m2, last.join(config, other_min, other));
+                    }
+                },
+                _ => panic!("self.root is leaf, but self.height > 1!"),
+            },
+
             //  (h, h + d), d > 1  -> recursive case
             //
-            _ => panic!("todo"),
+            (h_self, h) if h > h_self + 1 => match other.root {
+                Subtree::Branch(mut branch) => match *branch {
+                    Node::Binary(b1, m2, b2) => {
+                        let first = Tree {
+                            height: h - 1,
+                            root: b1,
+                        };
+                        let rest = Tree {
+                            height: h - 1,
+                            root: b2,
+                        };
+                        return self.join(config, other_min, first).join(config, m2, rest);
+                    }
+                    Node::Ternary(b1, m2, b2, m3, b3) => {
+                        let first = Tree {
+                            height: h - 1,
+                            root: b1,
+                        };
+                        let rest = Tree {
+                            height: h,
+                            root: update_branch!(branch, b2, m3, b3),
+                        };
+                        return self.join(config, other_min, first).join(config, m2, rest);
+                    }
+                },
+                _ => panic!("other.root is leaf, but other.height > 1!"),
+            },
+
+            _ => panic!(
+                "illegal case: self.height={}, other.height={}",
+                self.height, other.height
+            ),
         }
     }
 }
