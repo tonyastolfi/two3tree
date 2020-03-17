@@ -6,7 +6,7 @@ use crate::{TreeConfig, K};
 use itertools::Itertools;
 
 #[derive(Debug)]
-pub struct Queue(Vec<Update>);
+pub struct Queue(pub Vec<Update>);
 
 pub fn sort_batch(mut batch: Vec<Update>) -> Vec<Update> {
     batch.sort_by_cached_key(|update| *update.key());
@@ -20,6 +20,10 @@ impl Queue {
 
     pub fn from_batch(batch: Vec<Update>) -> Self {
         Self(sort_batch(batch))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 
     pub fn len(&self) -> usize {
@@ -186,7 +190,7 @@ pub fn plan_flush<T>(config: &TreeConfig, partition: &Node<usize, T>) -> Node<Op
         Node::Ternary(n0, _, n1, _, n2) => {
             let total = n0 + n1 + n2;
 
-            if total <= config.batch_size * 3 / 2 {
+            if total <= config.batch_size {
                 Node::Ternary(None, (), None, (), None)
             } else {
                 match (take_batch(*n0), take_batch(*n1), take_batch(*n2)) {

@@ -80,6 +80,64 @@ macro_rules! update_branch {
     };
 }
 
+macro_rules! rebuild_tree {
+    ($height:expr, $queue:expr, $branch:expr, $children:expr) => {
+        Tree {
+            height: $height,
+            root: Subtree::Branch($queue, {
+                *$branch = build_node($children);
+                $branch
+            }),
+        }
+    };
+}
+
+fn destruct_node(height: Height, node: Node<Subtree, K>) -> Node<Tree, K> {
+    match node {
+        Node::Binary(b0, m1, b1) => Node::Binary(
+            Tree {
+                height: height - 1,
+                root: b0,
+            },
+            m1,
+            Tree {
+                height: height - 1,
+                root: b1,
+            },
+        ),
+        Node::Ternary(b0, m1, b1, m2, b2) => Node::Ternary(
+            Tree {
+                height: height - 1,
+                root: b0,
+            },
+            m1,
+            Tree {
+                height: height - 1,
+                root: b1,
+            },
+            m2,
+            Tree {
+                height: height - 1,
+                root: b2,
+            },
+        ),
+    }
+}
+
+fn build_node(children: Node<Tree, K>) -> Node<Subtree, K> {
+    match children {
+        Node::Binary(t0, m1, t1) => {
+            assert_eq!(t0.height, t1.height);
+            Node::Binary(t0.root, m1, t1.root)
+        }
+        Node::Ternary(t0, m1, t1, m2, t2) => {
+            assert_eq!(t0.height, t1.height);
+            assert_eq!(t1.height, t2.height);
+            Node::Ternary(t0.root, m1, t1.root, m2, t2.root)
+        }
+    }
+}
+
 impl Tree {
     pub fn new() -> Self {
         Self {
@@ -131,195 +189,101 @@ impl Tree {
             Subtree::Branch(queue, mut branch) => {
                 use Node::{Binary, Ternary};
 
+                if queue.is_empty() {
+                    return Self {
+                        height: self.height,
+                        root: Subtree::Branch(Queue(batch), branch),
+                    };
+                }
+
                 let mut queue = queue.merge(batch);
                 let partition = queue.partition(&*branch);
                 let plan = plan_flush(config, &partition);
 
-                match (*branch, queue.flush(&partition, &plan)) {
+                match (
+                    destruct_node(self.height, *branch),
+                    queue.flush(&partition, &plan),
+                ) {
                     // No-flush cases.
                     //
-                    (Binary(b0, m1, b1), Binary(None, _, None)) => {
-                        *branch = Binary(b0, m1, b1);
-                        return Tree {
-                            height: self.height,
-                            root: Subtree::Branch(queue, branch),
-                        };
+                    (children, Binary(None, _, None)) => {
+                        return rebuild_tree!(self.height, queue, branch, children);
                     }
-                    (Ternary(b0, m1, b1, m2, b2), Ternary(None, _, None, _, None)) => {
-                        *branch = Ternary(b0, m1, b1, m2, b2);
-                        return Tree {
-                            height: self.height,
-                            root: Subtree::Branch(queue, branch),
-                        };
+                    (children, Ternary(None, _, None, _, None)) => {
+                        return rebuild_tree!(self.height, queue, branch, children);
                     }
 
-                    // Flush one subtree cases.
+                    // Flush left.
                     //
                     (Binary(b0, m1, b1), Binary(Some(x0), _, None)) => {
-                        return Tree {
-                            height: self.height - 1,
-                            root: b0,
-                        }
-                        .update(config, x0)
-                        .join(
-                            config,
-                            m1,
-                            Tree {
-                                height: self.height - 1,
-                                root: b1,
-                            },
-                        )
-                        .update(config, queue.consume());
-                    }
-                    (Binary(b0, m1, b1), Binary(None, _, Some(x1))) => {
-                        return Tree {
-                            height: self.height - 1,
-                            root: b0,
-                        }
-                        .join(
-                            config,
-                            m1,
-                            Tree {
-                                height: self.height - 1,
-                                root: b1,
-                            }
-                            .update(config, x1),
-                        )
-                        .update(config, queue.consume())
+                        return (b0.update(config, x0))
+                            .join(config, m1, b1)
+                            .update(config, queue.consume());
                     }
                     (Ternary(b0, m1, b1, m2, b2), Ternary(Some(x0), _, None, _, None)) => {
-                        return Tree {
-                            height: self.height - 1,
-                            root: b0,
-                        }
-                        .update(config, x0)
-                        .join(
-                            config,
-                            m1,
-                            Tree {
-                                height: self.height,
-                                root: update_branch!(queue, branch, b1, m2, b2),
-                            },
-                        );
-                    }
-                    (Ternary(b0, m1, b1, m2, b2), Ternary(None, _, Some(x1), _, None)) => {
-                        return Tree {
-                            height: self.height - 1,
-                            root: b0,
-                        }
-                        .join(
-                            config,
-                            m1,
-                            Tree {
-                                height: self.height - 1,
-                                root: b1,
-                            }
-                            .update(config, x1),
-                        )
-                        .join(
-                            config,
-                            m2,
-                            Tree {
-                                height: self.height - 1,
-                                root: b2,
-                            },
-                        )
-                        .update(config, queue.consume());
-                    }
-                    (Ternary(b0, m1, b1, m2, b2), Ternary(None, _, None, _, Some(x2))) => {
-                        return Tree {
-                            height: self.height,
-                            root: update_branch!(queue, branch, b0, m1, b1),
-                        }
-                        .join(
-                            config,
-                            m2,
-                            Tree {
-                                height: self.height - 1,
-                                root: b2,
-                            }
-                            .update(config, x2),
-                        );
+                        return (b0.update(config, x0))
+                            .join(config, m1, b1)
+                            .join(config, m2, b2)
+                            .update(config, queue.consume());
                     }
 
-                    // Flush two subtree cases.
+                    // Flush right.
+                    //
+                    (Binary(b0, m1, b1), Binary(None, _, Some(x1))) => {
+                        return b0
+                            .join(config, m1, b1.update(config, x1))
+                            .update(config, queue.consume())
+                    }
+                    (Ternary(b0, m1, b1, m2, b2), Ternary(None, _, None, _, Some(x2))) => {
+                        return b0
+                            .join(config, m1, b1)
+                            .join(config, m2, b2.update(config, x2))
+                            .update(config, queue.consume());
+                    }
+
+                    // Flush middle.
+                    //
+                    (Ternary(b0, m1, b1, m2, b2), Ternary(None, _, Some(x1), _, None)) => {
+                        return b0
+                            .join(config, m1, b1.update(config, x1))
+                            .join(config, m2, b2)
+                            .update(config, queue.consume());
+                    }
+
+                    // Flush left, middle.
                     //
                     (Ternary(b0, m1, b1, m2, b2), Ternary(Some(x0), _, Some(x1), _, None)) => {
-                        return Tree {
-                            height: self.height - 1,
-                            root: b0,
-                        }
-                        .update(config, x0)
-                        .join(
-                            config,
-                            m1,
-                            Tree {
-                                height: self.height - 1,
-                                root: b1,
-                            }
-                            .update(config, x1),
-                        )
-                        .join(
-                            config,
-                            m2,
-                            Tree {
-                                height: self.height - 1,
-                                root: b2,
-                            },
-                        )
-                        .update(config, queue.consume());
+                        return (b0.update(config, x0))
+                            .join(config, m1, b1.update(config, x1))
+                            .join(config, m2, b2)
+                            .update(config, queue.consume());
                     }
+
+                    // Flush left, right.
+                    //
                     (Ternary(b0, m1, b1, m2, b2), Ternary(Some(x0), _, None, _, Some(x2))) => {
-                        return Tree {
-                            height: self.height - 1,
-                            root: b0,
-                        }
-                        .update(config, x0)
-                        .join(
-                            config,
-                            m1,
-                            Tree {
-                                height: self.height - 1,
-                                root: b1,
-                            },
-                        )
-                        .join(
-                            config,
-                            m2,
-                            Tree {
-                                height: self.height - 1,
-                                root: b2,
-                            }
-                            .update(config, x2),
-                        )
-                        .update(config, queue.consume());
+                        return (b0.update(config, x0))
+                            .join(config, m1, b1)
+                            .join(config, m2, b2.update(config, x2))
+                            .update(config, queue.consume());
                     }
+
+                    // Flush middle, right.
+                    //
                     (Ternary(b0, m1, b1, m2, b2), Ternary(None, _, Some(x1), _, Some(x2))) => {
-                        return Tree {
-                            height: self.height - 1,
-                            root: b0,
-                        }
-                        .join(
-                            config,
-                            m1,
-                            Tree {
-                                height: self.height - 1,
-                                root: b1,
-                            }
-                            .update(config, x1),
-                        )
-                        .join(
-                            config,
-                            m2,
-                            Tree {
-                                height: self.height - 1,
-                                root: b2,
-                            }
-                            .update(config, x2),
-                        )
-                        .update(config, queue.consume());
+                        return b0
+                            .join(config, m1, b1.update(config, x1))
+                            .join(config, m2, b2.update(config, x2))
+                            .update(config, queue.consume());
                     }
-                    (node, _) => panic!("illegal plan {:?} for node {:?}", plan, node),
+
+                    // Badness.
+                    //
+                    (children, _) => panic!(
+                        "illegal plan {:?} for node {:?}",
+                        plan,
+                        build_node(children)
+                    ),
                 }
             }
         }
@@ -378,72 +342,42 @@ impl Tree {
             //  (h + d, h), d > 1  -> recursive case
             //
             (h, other_h) if h > other_h + 1 => match self.root {
-                Subtree::Branch(queue, mut branch) => match *branch {
-                    Node::Binary(b0, m1, b1) => {
-                        let initial = Tree {
-                            height: h - 1,
-                            root: b0,
-                        };
-                        let last = Tree {
-                            height: h - 1,
-                            root: b1,
-                        };
-                        return initial
-                            .join(config, m1, last.join(config, other_min, other))
-                            .update(config, queue.consume());
+                Subtree::Branch(queue, mut branch) => {
+                    match (destruct_node(h, *branch), other_min, other) {
+                        (Node::Binary(b0, m1, b1), m2, b2) => {
+                            return b0
+                                .join(config, m1, b1.join(config, m2, b2))
+                                .update(config, queue.consume());
+                        }
+                        (Node::Ternary(b0, m1, b1, m2, b2), m3, b3) => {
+                            return b0
+                                .join(config, m1, b1)
+                                .join(config, m2, b2.join(config, m3, b3))
+                                .update(config, queue.consume());
+                        }
                     }
-                    Node::Ternary(b0, m1, b1, m2, b2) => {
-                        let (q01, q2) = queue.split(&m2);
-                        let initial = Tree {
-                            height: h,
-                            root: update_branch!(q01, branch, b0, m1, b1),
-                        };
-                        let last = Tree {
-                            height: h - 1,
-                            root: b2,
-                        };
-                        return initial
-                            .join(config, m2, last.join(config, other_min, other))
-                            .update(config, q2.consume());
-                    }
-                },
+                }
                 _ => panic!("self.root is leaf, but self.height > 1!"),
             },
 
             //  (h, h + d), d > 1  -> recursive case
             //
             (h_self, h) if h > h_self + 1 => match other.root {
-                Subtree::Branch(queue, mut branch) => match *branch {
-                    Node::Binary(b1, m2, b2) => {
-                        let first = Tree {
-                            height: h - 1,
-                            root: b1,
-                        };
-                        let rest = Tree {
-                            height: h - 1,
-                            root: b2,
-                        };
-                        return self
-                            .join(config, other_min, first)
-                            .join(config, m2, rest)
-                            .update(config, queue.consume());
+                Subtree::Branch(queue, mut branch) => {
+                    match (self, other_min, destruct_node(h, *branch)) {
+                        (b0, m1, Node::Binary(b1, m2, b2)) => {
+                            return (b0.join(config, m1, b1))
+                                .join(config, m2, b2)
+                                .update(config, queue.consume());
+                        }
+                        (b0, m1, Node::Ternary(b1, m2, b2, m3, b3)) => {
+                            return (b0.join(config, m1, b1))
+                                .join(config, m2, b2)
+                                .join(config, m3, b3)
+                                .update(config, queue.consume());
+                        }
                     }
-                    Node::Ternary(b1, m2, b2, m3, b3) => {
-                        let (q1, q23) = queue.split(&m2);
-                        let first = Tree {
-                            height: h - 1,
-                            root: b1,
-                        };
-                        let rest = Tree {
-                            height: h,
-                            root: update_branch!(q23, branch, b2, m3, b3),
-                        };
-                        return self
-                            .join(config, other_min, first)
-                            .join(config, m2, rest)
-                            .update(config, q1.consume());
-                    }
-                },
+                }
                 _ => panic!("other.root is leaf, but other.height > 1!"),
             },
 
