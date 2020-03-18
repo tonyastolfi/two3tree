@@ -75,53 +75,6 @@ pub struct Tree {
     root: Subtree,
 }
 
-macro_rules! make_tree {
-    ($queue:expr, $branch:expr, $h:expr, $b0:expr, $m1:expr, $b1:expr, $m2:expr, $b2:expr) => {{
-        *$branch = Node::Ternary($b0, $m1, $b1, $m2, $b2);
-        Tree {
-            height: $h,
-            root: Subtree::Branch($queue, $branch),
-        }
-    }};
-    ($queue:expr, $branch:expr, $h:expr, $b0:expr, $m1:expr, $b1:expr, $m2:expr, $b2:expr, $m3:expr, $b3:expr) => {{
-        // TODO : split $queue at key=$m2
-        let (q01, q23) = $queue.split(&$m2);
-        *$branch = Node::Binary($b0, $m1, $b1);
-        Tree {
-            height: $h + 1,
-            root: Subtree::Branch(
-                Queue::new(),
-                Box::new(Node::Binary(
-                    Subtree::Branch(q01, $branch),
-                    $m2,
-                    Subtree::Branch(q23, Box::new(Node::Binary($b2, $m3, $b3))),
-                )),
-            ),
-        }
-    }};
-}
-
-macro_rules! update_branch {
-    ($queue:expr, $branch:expr, $b0:expr, $m1:expr, $b1:expr) => {
-        Subtree::Branch($queue, {
-            *$branch = Node::Binary($b0, $m1, $b1);
-            $branch
-        })
-    };
-}
-
-macro_rules! rebuild_tree {
-    ($height:expr, $queue:expr, $branch:expr, $children:expr) => {
-        Tree {
-            height: $height,
-            root: Subtree::Branch($queue, {
-                *$branch = build_node($children);
-                $branch
-            }),
-        }
-    };
-}
-
 fn destruct_node(height: Height, node: Node<Subtree, K>) -> Node<Tree, K> {
     match node {
         Node::Binary(b0, m1, b1) => Node::Binary(
@@ -166,6 +119,56 @@ fn build_node(children: Node<Tree, K>) -> Node<Subtree, K> {
             Node::Ternary(t0.root, m1, t1.root, m2, t2.root)
         }
     }
+}
+
+macro_rules! update_branch {
+    ($queue:expr, $branch:expr, $b0:expr, $m1:expr, $b1:expr) => {
+        Subtree::Branch($queue, {
+            *$branch = Node::Binary($b0, $m1, $b1);
+            $branch
+        })
+    };
+    ($queue:expr, $branch:expr, $b0:expr, $m1:expr, $b1:expr, $m2:expr, $b2:expr) => {
+        Subtree::Branch($queue, {
+            *$branch = Node::Ternary($b0, $m1, $b1, $m2, $b2);
+            $branch
+        })
+    };
+}
+
+macro_rules! rebuild_tree {
+    ($height:expr, $queue:expr, $branch:expr, $children:expr) => {
+        Tree {
+            height: $height,
+            root: Subtree::Branch($queue, {
+                *$branch = build_node($children);
+                $branch
+            }),
+        }
+    };
+}
+
+macro_rules! make_tree {
+    ($queue:expr, $branch:expr, $h:expr, $b0:expr, $m1:expr, $b1:expr, $m2:expr, $b2:expr) => {{
+        Tree {
+            height: $h,
+            root: update_branch!($queue, $branch, $b0, $m1, $b1, $m2, $b2),
+        }
+    }};
+    ($queue:expr, $branch:expr, $h:expr, $b0:expr, $m1:expr, $b1:expr, $m2:expr, $b2:expr, $m3:expr, $b3:expr) => {{
+        let (q01, q23) = $queue.split(&$m2);
+        Tree {
+            height: $h + 1,
+            root: Subtree::Branch(
+                Queue::new(),
+                Box::new(Node::Binary(
+                    update_branch!(q01, $branch, $b0, $m1, $b1),
+                    $m2,
+                    Subtree::Branch(q23, Box::new(Node::Binary($b2, $m3, $b3))),
+                )),
+            ),
+        }
+    }};
 }
 
 impl Tree {
