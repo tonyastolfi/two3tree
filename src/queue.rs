@@ -1,25 +1,83 @@
+use std::ops::Deref;
+
 use crate::algo::*;
 use crate::node::Node;
 use crate::update::Update;
-use crate::{TreeConfig, K};
+use crate::{Subtree, TreeConfig, K};
 
 use itertools::Itertools;
 
-#[derive(Debug)]
-pub struct Queue(pub Vec<Update>);
+pub struct Queue(SortedUpdates);
 
-pub fn sort_batch(mut batch: Vec<Update>) -> Vec<Update> {
-    batch.sort_by_cached_key(|update| *update.key());
-    batch
+#[derive(Debug, Clone)]
+pub struct Batch(SortedUpdates);
+
+#[derive(Debug, Clone)]
+pub struct SortedUpdates(Vec<Update>);
+
+impl SortedUpdates {
+    pub fn new(mut updates: Vec<Update>) -> Self {
+        updates.sort_by_cached_key(|update| *update.key());
+        Self(updates)
+    }
+
+    pub fn merge(self, other: Self) -> Self {
+        use itertools::EitherOrBoth::{Both, Left, Right};
+
+        Self(
+            self.0
+                .into_iter()
+                .merge_join_by(other.0.into_iter(), |a, b| a.key().cmp(b.key()))
+                .map(|either| match either {
+                    Left(update) => update,
+                    Right(update) => update,
+                    Both(_, latest) => latest,
+                })
+                .collect(),
+        )
+    }
+}
+
+impl From<SortedUpdates> for Vec<Update> {
+    fn from(sorted: SortedUpdates) -> Self {
+        sorted.0
+    }
+}
+
+impl Deref for SortedUpdates {
+    type Target = [Update];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Batch {
+    pub fn new(config: &TreeConfig, updates: SortedUpdates) -> Result<Self, SortedUpdates> {
+        if config.batch_size / 2 <= updates.len() && updates.len() <= config.batch_size {
+            Ok(Self(updates))
+        } else {
+            Err(updates)
+        }
+    }
+
+    pub fn consume(self) -> SortedUpdates {
+        self.0
+    }
+}
+
+pub struct BatchSize<'a>(&'a TreeConfig, usize);
+
+impl From<SortedUpdates> for Queue {
+    fn from(updates: SortedUpdates) -> Self {
+        assert!(updates.len());
+        Self(updates.into())
+    }
 }
 
 impl Queue {
     pub fn new() -> Self {
         Self(Vec::new())
-    }
-
-    pub fn from_batch(batch: Vec<Update>) -> Self {
-        Self(sort_batch(batch))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -34,25 +92,37 @@ impl Queue {
         self.0
     }
 
-    pub fn merge(self, batch: Vec<Update>) -> Self {
-        use itertools::EitherOrBoth::{Both, Left, Right};
-
-        let Self(items) = self;
-        Self(
-            items
-                .into_iter()
-                .merge_join_by(sort_batch(batch).into_iter(), |a, b| a.key().cmp(b.key()))
-                .map(|either| match either {
-                    Left(update) => update,
-                    Right(update) => update,
-                    Both(_, latest) => latest,
-                })
-                .collect(),
-        )
+    pub fn push(self, u: Update) -> Self {
+        self.merge_no_order_check(vec![u])
     }
+
+    pub fn update(self, batch: Batch) -> Self {
+        self.merge_no_order_check(batch.consume())
+    }
+
+    pub fn merge(self, other: Queue) -> Self {
+        self.merge_no_order_check(other.consume())
+    }
+
+    fn merge_no_order_check(self, updates_sorted_by_key: Vec<Update>) -> Self {}
 
     pub fn iter<'a>(&'a self) -> impl Iterator<Item = &'a Update> + 'a {
         self.0.iter()
+    }
+
+    pub fn merge_iter<'a, OtherIter: Iterator<Item = &'a K> + 'a>(
+        &'a self,
+        other_iter: OtherIter,
+    ) -> impl Iterator<Item = &'a K> + 'a {
+        use itertools::EitherOrBoth::{Both, Left, Right};
+
+        other_iter
+            .merge_join_by(self.iter(), |a, b| a.cmp(&b.key()))
+            .filter_map(|either| match either {
+                Left(from_child) => Some(from_child),
+                Right(from_queue) => from_queue.resolve(),
+                Both(_, from_queue) => from_queue.resolve(),
+            })
     }
 
     pub fn find<'a>(&'a self, key: &K) -> Option<&'a Update> {
@@ -79,21 +149,34 @@ impl Queue {
         }
     }
 
-    pub fn split(self, m: &i32) -> (Self, Self) {
-        let Self(mut queue) = self;
-        let ind = lower_bound_by_key(&queue, m, |update| *update.key());
-        let split: Vec<Update> = queue.split_off(ind);
-        (Self(queue), Self(split))
+    pub fn split_at_key(self, key: &K) -> (Self, Self) {
+        let Self(updates) = self;
+        let index = lower_bound_by_key(&updates, key, |update| *update.key());
+        Self::split_off(updates, index)
+    }
+
+    pub fn split_in_half(self) -> (Self, Self) {
+        let Self(mut updates) = self;
+        Self::split_off(updates, updates.len() / 2)
+    }
+
+    fn split_off(mut before: Vec<Update>, index: usize) -> (Self, Self) {
+        let after: Vec<Update> = before.split_off(index);
+        (Self(before), Self(after))
     }
 
     pub fn flush(
         &mut self,
+        config: &TreeConfig,
         partition: &Node<usize, K>,
         plan: &Node<Option<usize>, ()>,
-    ) -> Node<Option<Vec<Update>>, ()> {
+    ) -> Node<Option<Batch>, ()> {
         use Node::*;
 
         let Queue(ref mut queue) = self;
+
+        let prepare =
+            |updates: Vec<Update>| -> Option<Batch> { Some(Batch::new(config, updates).unwrap()) };
 
         match (partition, plan) {
             // no flush
@@ -107,8 +190,8 @@ impl Queue {
                 let new_queue = queue.split_off(*y);
                 let Queue(batch) = std::mem::replace(self, Queue(new_queue));
                 match plan {
-                    Binary(..) => Binary(Some(batch), (), None),
-                    Ternary(..) => Ternary(Some(batch), (), None, (), None),
+                    Binary(..) => Binary(prepare(batch), (), None),
+                    Ternary(..) => Ternary(prepare(batch), (), None, (), None),
                 }
             }
 
@@ -117,8 +200,8 @@ impl Queue {
             (_, Binary(None, _, Some(y))) | (_, Ternary(None, _, None, _, Some(y))) => {
                 let batch = queue.split_off(queue.len() - y);
                 match plan {
-                    Binary(..) => Binary(None, (), Some(batch)),
-                    Ternary(..) => Ternary(None, (), None, (), Some(batch)),
+                    Binary(..) => Binary(None, (), prepare(batch)),
+                    Ternary(..) => Ternary(None, (), None, (), prepare(batch)),
                 }
             }
 
@@ -128,7 +211,7 @@ impl Queue {
             //
             (Ternary(n0, _, n1, _, n2), Ternary(None, _, Some(y1), _, None)) => {
                 let batch = queue.drain(*n0..(n0 + y1)).collect();
-                Ternary(None, (), Some(batch), (), None)
+                Ternary(None, (), prepare(batch), (), None)
             }
 
             // flush left, middle
@@ -136,7 +219,7 @@ impl Queue {
             (Ternary(n0, _, n1, _, n2), Ternary(Some(y0), _, Some(y1), _, None)) => {
                 let mut batch0: Vec<Update> = queue.drain((n0 - y0)..(n0 + y1)).collect();
                 let batch1 = batch0.split_off(*y0);
-                Ternary(Some(batch0), (), Some(batch1), (), None)
+                Ternary(prepare(batch0), (), prepare(batch1), (), None)
             }
 
             // flush left, right
@@ -145,7 +228,7 @@ impl Queue {
                 let new_queue = queue.split_off(*y0);
                 let batch0 = std::mem::replace(queue, new_queue);
                 let batch2 = queue.split_off(queue.len() - *y2);
-                Ternary(Some(batch0), (), None, (), Some(batch2))
+                Ternary(prepare(batch0), (), None, (), prepare(batch2))
             }
 
             // flush middle, right
@@ -154,7 +237,7 @@ impl Queue {
                 let mut batch1: Vec<Update> =
                     queue.drain(((n0 + n1) - y1)..((n0 + n1) + y2)).collect();
                 let batch2 = batch1.split_off(*y1);
-                Ternary(None, (), Some(batch1), (), Some(batch2))
+                Ternary(None, (), prepare(batch1), (), prepare(batch2))
             }
 
             _ => panic!("partition/plan mismatch"),
