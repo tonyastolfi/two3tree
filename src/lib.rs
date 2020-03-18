@@ -36,6 +36,36 @@ impl Subtree {
             _ => panic!("not a Leaf!"),
         }
     }
+
+    pub fn find(&self, key: &K) -> Option<&K> {
+        match self {
+            Subtree::Leaf(vals) => match vals.binary_search(key) {
+                Ok(index) => Some(&vals[index]),
+                Err(_) => None,
+            },
+            Subtree::Branch(ref queue, ref branch) => match queue.find(key) {
+                Some(ref update) => update.resolve(),
+                None => match &**branch {
+                    Node::Binary(b0, m1, b1) => {
+                        if key < m1 {
+                            b0.find(key)
+                        } else {
+                            b1.find(key)
+                        }
+                    }
+                    Node::Ternary(b0, m1, b1, m2, b2) => {
+                        if key < m1 {
+                            b0.find(key)
+                        } else if key < m2 {
+                            b1.find(key)
+                        } else {
+                            b2.find(key)
+                        }
+                    }
+                },
+            },
+        }
+    }
 }
 
 pub type Height = u16;
@@ -166,6 +196,10 @@ impl Tree {
                 )),
             ),
         };
+    }
+
+    pub fn find(&self, key: &K) -> Option<&K> {
+        self.root.find(key)
     }
 
     pub fn update(self, config: &TreeConfig, batch: Vec<Update>) -> Self {
