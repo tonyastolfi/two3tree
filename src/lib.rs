@@ -316,7 +316,7 @@ impl Subtree {
     }
 
     pub fn update(self, config: &TreeConfig, batch: Batch) -> Self {
-        self.enqueue_or_flush(config, batch.consume())
+        self.enqueue_or_flush(config, SortedUpdates::from(batch))
     }
 
     fn enqueue_or_flush(self, config: &TreeConfig, updates: SortedUpdates) -> Self {
@@ -334,11 +334,11 @@ impl Subtree {
                 if queue.is_empty() && updates.len() <= config.batch_size {
                     Self {
                         height: self.height,
-                        root: Child::Branch(Queue::from_sorted_updates(updates), branch),
+                        root: Child::Branch(Queue::from((config, updates)), branch),
                     }
                 } else {
-                    let queued = SortedUpdates::from(queue).merge(updates);
-                    let partition = queue.partition(&*branch);
+                    let merged_updates = SortedUpdates::from(queue).merge(updates);
+                    let partition = merged_updates.partition(&*branch);
                     let plan = plan_flush(config, &partition);
 
                     match (
@@ -502,13 +502,13 @@ impl Subtree {
                         (b0, m1, Node::Binary(b1, m2, b2)) => {
                             return (b0.join(config, m1, b1))
                                 .join(config, m2, b2)
-                                .replace_queue(config, queue, true);
+                                .replace_queue(config, queue);
                         }
                         (b0, m1, Node::Ternary(b1, m2, b2, m3, b3)) => {
                             return (b0.join(config, m1, b1))
                                 .join(config, m2, b2)
                                 .join(config, m3, b3)
-                                .replace_queue(config, queue, true);
+                                .replace_queue(config, queue);
                         }
                     }
                 }

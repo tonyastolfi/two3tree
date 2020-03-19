@@ -1,4 +1,4 @@
-use std::ops::Deref;
+use std::ops::{Deref, RangeBounds};
 
 use crate::algo::*;
 use crate::node::Node;
@@ -36,6 +36,17 @@ impl SortedUpdates {
                 .collect(),
         )
     }
+
+    pub fn split_off(&mut self, index: usize) -> Self {
+        Self(self.0.split_off(index))
+    }
+
+    pub fn drain<'a, R>(&'a mut self, range: R) -> impl Iterator<Item = Update> + 'a
+    where
+        R: RangeBounds<usize>,
+    {
+        self.0.drain(range)
+    }
 }
 
 impl From<SortedUpdates> for Vec<Update> {
@@ -49,6 +60,31 @@ impl Deref for SortedUpdates {
 
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+trait Partition {
+    fn partition<_Ignored>(&self, pivots: &Node<_Ignored, K>) -> Node<usize, K>;
+}
+
+impl<T> Partition for T
+where
+    T: Deref<Target = [Update]>,
+{
+    fn partition<_Ignored>(&self, pivots: &Node<_Ignored, K>) -> Node<usize, K> {
+        match pivots {
+            Node::Binary(_, p1, _) => {
+                let len0 = lower_bound_by_key(self, &p1, |msg| msg.key());
+                let len1 = self.len() - len0;
+                Node::Binary(len0, *p1, len1)
+            }
+            Node::Ternary(_, p1, _, p2, _) => {
+                let len0 = lower_bound_by_key(self, &p1, |msg| msg.key());
+                let len1 = lower_bound_by_key(&self[len0..], &p2, |msg| msg.key());
+                let len2 = self.len() - (len0 + len1);
+                Node::Ternary(len0, *p1, len1, *p2, len2)
+            }
+        }
     }
 }
 
@@ -68,9 +104,10 @@ impl Batch {
 
 pub struct BatchSize<'a>(&'a TreeConfig, usize);
 
-impl From<SortedUpdates> for Queue {
-    fn from(updates: SortedUpdates) -> Self {
-        assert!(updates.len());
+impl<'a> From<(&'a TreeConfig, SortedUpdates)> for Queue {
+    fn from((config, updates): (&'a TreeConfig, SortedUpdates)) -> Self {
+        // When created, a Queue can be at most `B` elements large.
+        assert!(updates.len() <= config.batch_size);
         Self(updates.into())
     }
 }
@@ -86,10 +123,6 @@ impl Queue {
 
     pub fn len(&self) -> usize {
         self.0.len()
-    }
-
-    pub fn consume(self) -> Vec<Update> {
-        self.0
     }
 
     pub fn push(self, u: Update) -> Self {
@@ -131,23 +164,6 @@ impl Queue {
             Result::Err(_) => None,
         }
     }
-    pub fn partition<U>(&self, pivots: &Node<U, K>) -> Node<usize, K> {
-        let Self(ref queue) = self;
-
-        match pivots {
-            Node::Binary(_, p1, _) => {
-                let len0 = lower_bound_by_key(queue, &p1, |msg| msg.key());
-                let len1 = queue.len() - len0;
-                Node::Binary(len0, *p1, len1)
-            }
-            Node::Ternary(_, p1, _, p2, _) => {
-                let len0 = lower_bound_by_key(queue, &p1, |msg| msg.key());
-                let len1 = lower_bound_by_key(&&queue[len0..], &p2, |msg| msg.key());
-                let len2 = queue.len() - (len0 + len1);
-                Node::Ternary(len0, *p1, len1, *p2, len2)
-            }
-        }
-    }
 
     pub fn split_at_key(self, key: &K) -> (Self, Self) {
         let Self(updates) = self;
@@ -173,7 +189,7 @@ impl Queue {
     ) -> Node<Option<Batch>, ()> {
         use Node::*;
 
-        let Queue(ref mut queue) = self;
+        let Queue(ref mut sorted_updates) = self;
 
         let prepare =
             |updates: Vec<Update>| -> Option<Batch> { Some(Batch::new(config, updates).unwrap()) };
@@ -187,7 +203,7 @@ impl Queue {
             // flush left
             //
             (_, Binary(Some(y), _, None)) | (_, Ternary(Some(y), _, None, _, None)) => {
-                let new_queue = queue.split_off(*y);
+                let new_queue = sorted_updates.split_off(*y);
                 let Queue(batch) = std::mem::replace(self, Queue(new_queue));
                 match plan {
                     Binary(..) => Binary(prepare(batch), (), None),
@@ -198,7 +214,7 @@ impl Queue {
             // flush right
             //
             (_, Binary(None, _, Some(y))) | (_, Ternary(None, _, None, _, Some(y))) => {
-                let batch = queue.split_off(queue.len() - y);
+                let batch = sorted_updates.split_off(sorted_updates.len() - y);
                 match plan {
                     Binary(..) => Binary(None, (), prepare(batch)),
                     Ternary(..) => Ternary(None, (), None, (), prepare(batch)),
@@ -210,14 +226,14 @@ impl Queue {
             // flush middle
             //
             (Ternary(n0, _, n1, _, n2), Ternary(None, _, Some(y1), _, None)) => {
-                let batch = queue.drain(*n0..(n0 + y1)).collect();
+                let batch = sorted_updates.drain(*n0..(n0 + y1)).collect();
                 Ternary(None, (), prepare(batch), (), None)
             }
 
             // flush left, middle
             //
             (Ternary(n0, _, n1, _, n2), Ternary(Some(y0), _, Some(y1), _, None)) => {
-                let mut batch0: Vec<Update> = queue.drain((n0 - y0)..(n0 + y1)).collect();
+                let mut batch0: Vec<Update> = sorted_updates.drain((n0 - y0)..(n0 + y1)).collect();
                 let batch1 = batch0.split_off(*y0);
                 Ternary(prepare(batch0), (), prepare(batch1), (), None)
             }
@@ -225,17 +241,18 @@ impl Queue {
             // flush left, right
             //
             (Ternary(n0, _, n1, _, n2), Ternary(Some(y0), _, None, _, Some(y2))) => {
-                let new_queue = queue.split_off(*y0);
-                let batch0 = std::mem::replace(queue, new_queue);
-                let batch2 = queue.split_off(queue.len() - *y2);
+                let new_queue = sorted_updates.split_off(*y0);
+                let batch0 = std::mem::replace(sorted_updates, new_queue);
+                let batch2 = sorted_updates.split_off(sorted_updates.len() - *y2);
                 Ternary(prepare(batch0), (), None, (), prepare(batch2))
             }
 
             // flush middle, right
             //
             (Ternary(n0, _, n1, _, n2), Ternary(None, _, Some(y1), _, Some(y2))) => {
-                let mut batch1: Vec<Update> =
-                    queue.drain(((n0 + n1) - y1)..((n0 + n1) + y2)).collect();
+                let mut batch1: Vec<Update> = sorted_updates
+                    .drain(((n0 + n1) - y1)..((n0 + n1) + y2))
+                    .collect();
                 let batch2 = batch1.split_off(*y1);
                 Ternary(None, (), prepare(batch1), (), prepare(batch2))
             }

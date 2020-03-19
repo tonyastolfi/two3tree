@@ -1,15 +1,19 @@
-pub fn lower_bound_by_key<'a, B, F, T: 'a, V: std::ops::Deref<Target = [T]>>(
-    v: &'a V,
-    b: &B,
-    f: F,
+use std::ops::Deref;
+
+pub fn lower_bound_by_key<'seq, Seq, Elem, Bound, KeyFn>(
+    seq: &'seq Seq,
+    bound: &Bound,
+    key_fn: KeyFn,
 ) -> usize
 where
-    B: Ord,
-    F: FnMut(&'a T) -> B,
+    Seq: Deref<Target = [Elem]>,
+    Elem: 'seq,
+    Bound: Ord,
+    KeyFn: FnMut(&'seq Elem) -> Bound,
 {
-    match v.binary_search_by_key(b, f) {
-        Result::Ok(i) => i,
-        Result::Err(i) => i,
+    match seq.binary_search_by_key(bound, key_fn) {
+        Result::Ok(index) => index,
+        Result::Err(index) => index,
     }
 }
 
