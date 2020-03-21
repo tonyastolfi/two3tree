@@ -11,11 +11,13 @@ pub type K = i32;
 pub mod algo;
 pub mod node;
 pub mod queue;
+pub mod sorted_updates;
 pub mod update;
 
 use algo::{lower_bound_by_key, upper_bound_by_key};
 use node::Node;
-use queue::{plan_flush, Batch, Queue, SortedUpdates};
+use queue::{plan_flush, Batch, Queue};
+use sorted_updates::SortedUpdates;
 use update::Update;
 
 #[derive(Debug)]
