@@ -487,7 +487,7 @@ impl Subtree {
                 return Self {
                     height: h + 1,
                     root: Child::Branch(
-                        Queue::default(),
+                        Queue::default(), // TODO maybe allow this to pull from the calling context?
                         Box::new(Node::Binary(self.root, other_min, other.root)),
                     ),
                 };
@@ -635,16 +635,11 @@ mod tests {
         assert!(t.find(10) == None);
 
         t.insert(10);
-        //println!("{:#?}", t);
         t.check_invariants();
 
         assert_eq!(t.find(10), Some(&10));
 
         for k in 0..1000 {
-            //println!("k={}", k);
-            //if k == 71 {
-            //    println!("tree={:#?}", t);
-            //}
             t.insert(k);
             t.check_invariants();
         }
