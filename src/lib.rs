@@ -295,7 +295,7 @@ macro_rules! join_subtrees {
 impl Subtree {
     pub fn new() -> Self {
         Self {
-            height: 1,
+            height: 0,
             root: Child::Leaf(vec![]),
         }
     }
@@ -605,11 +605,13 @@ mod tests {
 
         t.insert(10);
         println!("{:#?}", t);
+        t.check_invariants();
 
         assert_eq!(t.find(10), Some(&10));
 
         for k in 0..1000 {
             t.insert(k);
+            t.check_invariants();
         }
 
         for k in 0..1000 {
@@ -621,6 +623,7 @@ mod tests {
         for k in 1000..100000 {
             t.insert(k);
         }
+        t.check_invariants();
 
         for k in 1000..100000 {
             assert_eq!(t.find(k), Some(&k));
