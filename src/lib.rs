@@ -283,12 +283,12 @@ macro_rules! make_tree {
 macro_rules! join_subtrees {
     ($config:expr, $updates:expr, $b0:expr, $m1:expr, $b1:expr) => {{
         $b0.join($config, $m1, $b1)
-            .enqueue_or_flush($config, $updates)
+            .enqueue_or_flush($config, $updates, true)
     }};
     ($config:expr, $updates:expr, $b0:expr, $m1:expr, $b1:expr, $m2:expr, $b2:expr) => {{
         $b0.join($config, $m1, $b1)
             .join($config, $m2, $b2)
-            .enqueue_or_flush($config, $updates)
+            .enqueue_or_flush($config, $updates, true)
     }};
 }
 
@@ -345,7 +345,7 @@ impl Subtree {
     }
 
     pub fn update(self, config: &TreeConfig, batch: Batch) -> Self {
-        self.enqueue_or_flush(config, batch.consume())
+        self.enqueue_or_flush(config, batch.consume(), true)
     }
 
     fn update_opt(self, config: &TreeConfig, opt_batch: Option<Batch>) -> Self {
@@ -355,7 +355,12 @@ impl Subtree {
         }
     }
 
-    fn enqueue_or_flush(self, config: &TreeConfig, updates: SortedUpdates) -> Self {
+    fn enqueue_or_flush(
+        self,
+        config: &TreeConfig,
+        updates: SortedUpdates,
+        allow_flush: bool,
+    ) -> Self {
         assert!(updates.len() <= config.batch_size * 3 / 2);
 
         match self.root {
@@ -385,7 +390,33 @@ impl Subtree {
                 } else {
                     let mut merged_updates = queue.consume().merge(updates);
                     let partition = partition(&merged_updates, &*branch);
-                    let plan = plan_flush(config, &partition);
+                    let plan = if !allow_flush {
+                        match &partition {
+                            Node::Binary(ref n0, _, ref n1) => {
+                                assert!(n0 + n1 <= config.batch_size);
+                                Node::Binary(None, (), None)
+                            }
+                            Node::Ternary(ref n0, _, ref n1, _, ref n2) => {
+                                assert!(
+                                    n0 + n1 <= config.batch_size,
+                                    "node is not 2/3 balanced: {:?}, queue={:?}, branch={:#?}",
+                                    partition,
+                                    merged_updates,
+                                    branch
+                                );
+                                assert!(
+                                    n1 + n2 <= config.batch_size,
+                                    "node is not 2/3 balanced: {:?}, queue={:?}, branch={:#?}",
+                                    partition,
+                                    merged_updates,
+                                    branch
+                                );
+                                Node::Ternary(None, (), None, (), None)
+                            }
+                        }
+                    } else {
+                        plan_flush(config, &partition)
+                    };
 
                     match (
                         subtrees_from_node(self.height, *branch),
@@ -604,12 +635,16 @@ mod tests {
         assert!(t.find(10) == None);
 
         t.insert(10);
-        println!("{:#?}", t);
+        //println!("{:#?}", t);
         t.check_invariants();
 
         assert_eq!(t.find(10), Some(&10));
 
         for k in 0..1000 {
+            //println!("k={}", k);
+            //if k == 71 {
+            //    println!("tree={:#?}", t);
+            //}
             t.insert(k);
             t.check_invariants();
         }
