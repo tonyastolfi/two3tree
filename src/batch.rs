@@ -1,4 +1,5 @@
 use crate::sorted_updates::SortedUpdates;
+use crate::TreeConfig;
 
 #[derive(Debug, Clone)]
 pub struct Batch(SortedUpdates);

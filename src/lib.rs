@@ -9,14 +9,20 @@ use itertools::Itertools;
 pub type K = i32;
 
 pub mod algo;
+pub mod batch;
+pub mod flush;
 pub mod node;
+pub mod partition;
 pub mod queue;
 pub mod sorted_updates;
 pub mod update;
 
 use algo::{lower_bound_by_key, upper_bound_by_key};
+use batch::Batch;
+use flush::{plan_flush, Flush};
 use node::Node;
-use queue::{plan_flush, Batch, Queue};
+use partition::partition;
+use queue::Queue;
 use sorted_updates::SortedUpdates;
 use update::Update;
 
@@ -39,20 +45,26 @@ impl Child {
         }
     }
 
-    pub fn check_height(&self) -> Height {
+    pub fn check_height(&self, config: &TreeConfig) -> Height {
         match self {
-            Child::Leaf(_) => 1,
+            Child::Leaf(vals) => {
+                if vals.len() < config.batch_size {
+                    0
+                } else {
+                    1
+                }
+            }
             Child::Branch(_, ref branch) => match &**branch {
                 Node::Binary(b0, _, b1) => {
-                    let h0 = b0.check_height();
-                    let h1 = b1.check_height();
+                    let h0 = b0.check_height(config);
+                    let h1 = b1.check_height(config);
                     assert_eq!(h0, h1);
                     h0 + 1
                 }
                 Node::Ternary(b0, _, b1, _, b2) => {
-                    let h0 = b0.check_height();
-                    let h1 = b1.check_height();
-                    let h2 = b2.check_height();
+                    let h0 = b0.check_height(config);
+                    let h1 = b1.check_height(config);
+                    let h2 = b2.check_height(config);
                     assert_eq!(h0, h1);
                     assert_eq!(h1, h2);
                     h0 + 1
@@ -61,41 +73,60 @@ impl Child {
         }
     }
 
-    pub fn check_queue_invariants(
+    pub fn check_invariants(
         &self,
         config: &TreeConfig,
+        height: Height,
         deep: bool,
-        old_queue: Option<&Queue>,
+        info: Option<&str>,
     ) {
-        if let Child::Branch(ref queue, ref branch) = self {
-            let node = &**branch;
-            match node {
-                Node::Binary(b0, _, b1) => {
-                    assert!(
-                        queue.len() <= config.batch_size,
-                        "queue is over-full: B={}, partition={:?}, queue={:?}, old={:?}",
-                        config.batch_size,
-                        queue.partition(&node),
-                        queue,
-                        old_queue,
-                    );
-                    if deep {
-                        b0.check_queue_invariants(config, deep, None);
-                        b1.check_queue_invariants(config, deep, None);
+        match self {
+            Child::Leaf(ref vals) => {
+                assert!(
+                    (vals.len() >= config.batch_size && height == 1)
+                        || (height == 0 && vals.len() < config.batch_size),
+                    "leaf too small: {:?}, {:?}",
+                    vals,
+                    info
+                );
+                assert!(
+                    vals.len() <= config.batch_size * 2,
+                    "leaf too big: {:?}, {:?}",
+                    vals,
+                    info
+                );
+            }
+            Child::Branch(ref queue, ref branch) => {
+                assert!(height > 1, "all non-leaf children must be at height > 1");
+                let node = &**branch;
+                match node {
+                    Node::Binary(b0, _, b1) => {
+                        assert!(
+                            queue.len() <= config.batch_size,
+                            "queue is over-full: B={}, partition={:?}, queue={:?}, old={:?}",
+                            config.batch_size,
+                            partition(queue, &node),
+                            queue,
+                            info,
+                        );
+                        if deep {
+                            b0.check_invariants(config, height - 1, deep, None);
+                            b1.check_invariants(config, height - 1, deep, None);
+                        }
                     }
-                }
-                Node::Ternary(b0, _, b1, _, b2) => {
-                    assert!(queue.len() <= config.batch_size * 3 / 2);
-                    if let Node::Ternary(n0, _, n1, _, n2) = queue.partition(node) {
-                        assert!(n0 + n1 <= config.batch_size);
-                        assert!(n1 + n2 <= config.batch_size);
-                    } else {
-                        panic!("Queue::partition should have returned a ternary node");
-                    }
-                    if deep {
-                        b0.check_queue_invariants(config, deep, None);
-                        b1.check_queue_invariants(config, deep, None);
-                        b2.check_queue_invariants(config, deep, None);
+                    Node::Ternary(b0, _, b1, _, b2) => {
+                        assert!(queue.len() <= config.batch_size * 3 / 2);
+                        if let Node::Ternary(n0, _, n1, _, n2) = partition(queue, node) {
+                            assert!(n0 + n1 <= config.batch_size);
+                            assert!(n1 + n2 <= config.batch_size);
+                        } else {
+                            panic!("Queue::partition should have returned a ternary node");
+                        }
+                        if deep {
+                            b0.check_invariants(config, height - 1, deep, None);
+                            b1.check_invariants(config, height - 1, deep, None);
+                            b2.check_invariants(config, height - 1, deep, None);
+                        }
                     }
                 }
             }
@@ -215,10 +246,10 @@ macro_rules! update_branch {
 }
 
 macro_rules! rebuild_tree {
-    ($height:expr, $queue:expr, $branch:expr, $subtrees:expr) => {
+    ($config:expr, $height:expr, $updates:expr, $branch:expr, $subtrees:expr) => {
         Subtree {
             height: $height,
-            root: Child::Branch($queue, {
+            root: Queue::with_no_flush($config, $updates, {
                 *$branch = node_from_subtrees($subtrees);
                 $branch
             }),
@@ -227,18 +258,18 @@ macro_rules! rebuild_tree {
 }
 
 macro_rules! make_tree {
-    ($queue:expr, $branch:expr, $h:expr, $b0:expr, $m1:expr, $b1:expr, $m2:expr, $b2:expr) => {{
+    ($config:expr, $queue:expr, $branch:expr, $h:expr, $b0:expr, $m1:expr, $b1:expr, $m2:expr, $b2:expr) => {{
         Subtree {
             height: $h,
             root: update_branch!($queue, $branch, $b0, $m1, $b1, $m2, $b2),
         }
     }};
-    ($queue:expr, $branch:expr, $h:expr, $b0:expr, $m1:expr, $b1:expr, $m2:expr, $b2:expr, $m3:expr, $b3:expr) => {{
-        let (q01, q23) = $queue.split_at_key(&$m2);
+    ($config:expr, $queue:expr, $branch:expr, $h:expr, $b0:expr, $m1:expr, $b1:expr, $m2:expr, $b2:expr, $m3:expr, $b3:expr) => {{
+        let (q01, q23) = $queue.split_at_key($config, &$m2);
         Subtree {
             height: $h + 1,
             root: Child::Branch(
-                Queue::new(),
+                Queue::default(),
                 Box::new(Node::Binary(
                     update_branch!(q01, $branch, $b0, $m1, $b1),
                     $m2,
@@ -249,20 +280,16 @@ macro_rules! make_tree {
     }};
 }
 
-pub fn update_leaf(config: &TreeConfig, leaf_vals: Vec<K>, updates: Vec<Update>) -> Subtree {
-    use itertools::EitherOrBoth::{Both, Left, Right};
-
-    let mut merged: Vec<K> = leaf_vals
-        .iter()
-        .merge_join_by(updates.into_iter(), |old, update| old.cmp(&update.key()))
-        .filter_map(|either| match either {
-            Left(old) => Some(*old),
-            Right(update) => update.resolve().map(|item_ref| *item_ref),
-            Both(_old, update) => update.resolve().map(|item_ref| *item_ref),
-        })
-        .collect();
-
-    Subtree::from_vals(config, merged)
+macro_rules! join_subtrees {
+    ($config:expr, $updates:expr, $b0:expr, $m1:expr, $b1:expr) => {{
+        $b0.join($config, $m1, $b1)
+            .enqueue_or_flush($config, $updates)
+    }};
+    ($config:expr, $updates:expr, $b0:expr, $m1:expr, $b1:expr, $m2:expr, $b2:expr) => {{
+        $b0.join($config, $m1, $b1)
+            .join($config, $m2, $b2)
+            .enqueue_or_flush($config, $updates)
+    }};
 }
 
 impl Subtree {
@@ -276,7 +303,7 @@ impl Subtree {
     pub fn from_vals(config: &TreeConfig, mut vals: Vec<K>) -> Self {
         if vals.len() <= config.batch_size * 2 {
             return Self {
-                height: 1,
+                height: if vals.len() < config.batch_size { 0 } else { 1 },
                 root: Child::Leaf(vals),
             };
         }
@@ -285,7 +312,7 @@ impl Subtree {
         return Self {
             height: 2,
             root: Child::Branch(
-                Queue::new(),
+                Queue::default(),
                 Box::new(Node::Binary(
                     Child::Leaf(vals),
                     split_min,
@@ -303,14 +330,14 @@ impl Subtree {
         self.height
     }
 
-    pub fn check_height(&self) -> Height {
-        assert_eq!(self.height, self.root.check_height());
+    pub fn check_height(&self, config: &TreeConfig) -> Height {
+        assert_eq!(self.height, self.root.check_height(config));
         self.height
     }
 
     pub fn check_invariants(&self, config: &TreeConfig) {
-        assert_eq!(self.height, self.root.check_height());
-        self.root.check_queue_invariants(config, true, None);
+        assert_eq!(self.height, self.root.check_height(config));
+        self.root.check_invariants(config, self.height, true, None);
     }
 
     pub fn find(&self, key: &K) -> Option<&K> {
@@ -318,96 +345,85 @@ impl Subtree {
     }
 
     pub fn update(self, config: &TreeConfig, batch: Batch) -> Self {
-        self.enqueue_or_flush(config, SortedUpdates::from(batch))
+        self.enqueue_or_flush(config, batch.consume())
+    }
+
+    fn update_opt(self, config: &TreeConfig, opt_batch: Option<Batch>) -> Self {
+        match opt_batch {
+            Some(batch) => self.update(config, batch),
+            None => self,
+        }
     }
 
     fn enqueue_or_flush(self, config: &TreeConfig, updates: SortedUpdates) -> Self {
         assert!(updates.len() <= config.batch_size * 3 / 2);
 
-        //let mut old_queue: Queue = Queue::new();
+        match self.root {
+            Child::Leaf(vals) => {
+                use itertools::EitherOrBoth::{Both, Left, Right};
 
-        let new_child = match self.root {
-            Child::Leaf(vals) => update_leaf(config, vals, updates),
+                let mut merged: Vec<K> = vals
+                    .iter()
+                    .merge_join_by(updates.into_iter(), |old, update| old.cmp(&update.key()))
+                    .filter_map(|either| match either {
+                        Left(old) => Some(*old),
+                        Right(update) => update.resolve().map(|item_ref| *item_ref),
+                        Both(_old, update) => update.resolve().map(|item_ref| *item_ref),
+                    })
+                    .collect();
+
+                Subtree::from_vals(config, merged)
+            }
             Child::Branch(queue, mut branch) => {
                 use Node::{Binary, Ternary};
-
-                // old_queue = queue.clone();
 
                 if queue.is_empty() && updates.len() <= config.batch_size {
                     Self {
                         height: self.height,
-                        root: Child::Branch(Queue::from((config, updates)), branch),
+                        root: Child::Branch(Queue::new(config, updates), branch),
                     }
                 } else {
-                    let merged_updates = SortedUpdates::from(queue).merge(updates);
-                    let partition = merged_updates.partition(&*branch);
+                    let mut merged_updates = queue.consume().merge(updates);
+                    let partition = partition(&merged_updates, &*branch);
                     let plan = plan_flush(config, &partition);
 
                     match (
                         subtrees_from_node(self.height, *branch),
-                        queue.flush(config, &partition, &plan),
+                        merged_updates.flush(config, &partition, &plan),
                     ) {
                         // No-flush cases.
                         //
                         (subtrees, Binary(None, _, None)) => {
-                            rebuild_tree!(self.height, queue, branch, subtrees)
+                            rebuild_tree!(config, self.height, merged_updates, branch, subtrees)
                         }
                         (subtrees, Ternary(None, _, None, _, None)) => {
-                            rebuild_tree!(self.height, queue, branch, subtrees)
+                            rebuild_tree!(config, self.height, merged_updates, branch, subtrees)
                         }
 
-                        // Flush left.
+                        // Illegal cases.
                         //
-                        (Binary(b0, m1, b1), Binary(Some(x0), _, None)) => (b0.update(config, x0))
-                            .join(config, m1, b1)
-                            .replace_queue(config, queue, false),
-                        (Ternary(b0, m1, b1, m2, b2), Ternary(Some(x0), _, None, _, None)) => (b0
-                            .update(config, x0))
-                        .join(config, m1, b1)
-                        .join(config, m2, b2)
-                        .replace_queue(config, queue, true),
-
-                        // Flush right.
-                        //
-                        (Binary(b0, m1, b1), Binary(None, _, Some(x1))) => b0
-                            .join(config, m1, b1.update(config, x1))
-                            .replace_queue(config, queue, false),
-                        (Ternary(b0, m1, b1, m2, b2), Ternary(None, _, None, _, Some(x2))) => b0
-                            .join(config, m1, b1)
-                            .join(config, m2, b2.update(config, x2))
-                            .replace_queue(config, queue, true),
-
-                        // Flush middle.
-                        //
-                        (Ternary(b0, m1, b1, m2, b2), Ternary(None, _, Some(x1), _, None)) => b0
-                            .join(config, m1, b1.update(config, x1))
-                            .join(config, m2, b2)
-                            .replace_queue(config, queue, true),
-
-                        // Flush left, middle.
-                        //
-                        (Ternary(b0, m1, b1, m2, b2), Ternary(Some(x0), _, Some(x1), _, None)) => {
-                            (b0.update(config, x0))
-                                .join(config, m1, b1.update(config, x1))
-                                .join(config, m2, b2)
-                                .replace_queue(config, queue, false)
+                        (_subtrees, Binary(Some(_), _, Some(_)))
+                        | (_subtrees, Ternary(Some(_), _, Some(_), _, Some(_))) => {
+                            panic!("Too many branches flushed!");
                         }
 
-                        // Flush left, right.
+                        // Binary node flush.
                         //
-                        (Ternary(b0, m1, b1, m2, b2), Ternary(Some(x0), _, None, _, Some(x2))) => {
-                            (b0.update(config, x0))
-                                .join(config, m1, b1)
-                                .join(config, m2, b2.update(config, x2))
-                                .replace_queue(config, queue, false)
+                        (Binary(b0, m1, b1), Binary(opt_x0, _, opt_x1)) => {
+                            let b0 = b0.update_opt(config, opt_x0);
+                            let b1 = b1.update_opt(config, opt_x1);
+
+                            join_subtrees!(config, merged_updates, b0, m1, b1)
                         }
 
-                        // Flush middle, right.
+                        // Ternary node flush.
                         //
-                        (Ternary(b0, m1, b1, m2, b2), Ternary(None, _, Some(x1), _, Some(x2))) => {
-                            b0.join(config, m1, b1.update(config, x1))
-                                .join(config, m2, b2.update(config, x2))
-                                .replace_queue(config, queue, false)
+                        (Ternary(b0, m1, b1, m2, b2), Ternary(opt_x0, _, opt_x1, _, opt_x2)) => {
+                            let b0 = b0.update_opt(config, opt_x0);
+                            let b1 = b1.update_opt(config, opt_x1);
+                            let b2 = b2.update_opt(config, opt_x2);
+
+                            join_subtrees!(config, merged_updates, b0, m1, b1, m2, b2)
                         }
 
                         // Badness.
@@ -420,9 +436,7 @@ impl Subtree {
                     }
                 }
             }
-        };
-        new_child.root.check_queue_invariants(config, false, None); //Some(&old_queue));
-        new_child
+        }
     }
 
     pub fn join(self, config: &TreeConfig, other_min: K, other: Subtree) -> Self {
@@ -430,10 +444,10 @@ impl Subtree {
             // Join the leaf values, producing either a single new leaf or two
             // leaves under a new binary node.
             //
-            (1, 1) => {
+            (h, other_h) if h <= 1 && other_h <= 1 => {
                 let mut vals = self.root.consume_leaf();
                 vals.append(&mut other.root.consume_leaf());
-                return Subtree::from_vals(config, vals);
+                Subtree::from_vals(config, vals)
             }
 
             // Grow the tree under a new binary node.
@@ -442,7 +456,7 @@ impl Subtree {
                 return Self {
                     height: h + 1,
                     root: Child::Branch(
-                        Queue::new(),
+                        Queue::default(),
                         Box::new(Node::Binary(self.root, other_min, other.root)),
                     ),
                 };
@@ -453,10 +467,10 @@ impl Subtree {
             (h, other_h) if h == other_h + 1 => match self.root {
                 Child::Branch(queue, mut branch) => match (*branch, other_min, other.root) {
                     (Node::Binary(b0, m1, b1), m2, b2) => {
-                        return make_tree!(queue, branch, h, b0, m1, b1, m2, b2);
+                        return make_tree!(config, queue, branch, h, b0, m1, b1, m2, b2);
                     }
                     (Node::Ternary(b0, m1, b1, m2, b2), m3, b3) => {
-                        return make_tree!(queue, branch, h, b0, m1, b1, m2, b2, m3, b3);
+                        return make_tree!(config, queue, branch, h, b0, m1, b1, m2, b2, m3, b3);
                     }
                 },
                 _ => panic!("self.root is leaf, but self.height > 0!"),
@@ -466,10 +480,10 @@ impl Subtree {
             (self_h, h) if self_h + 1 == h => match other.root {
                 Child::Branch(queue, mut branch) => match (self.root, other_min, *branch) {
                     (b0, m1, Node::Binary(b1, m2, b2)) => {
-                        return make_tree!(queue, branch, h, b0, m1, b1, m2, b2);
+                        return make_tree!(config, queue, branch, h, b0, m1, b1, m2, b2);
                     }
                     (b0, m1, Node::Ternary(b1, m2, b2, m3, b3)) => {
-                        return make_tree!(queue, branch, h, b0, m1, b1, m2, b2, m3, b3);
+                        return make_tree!(config, queue, branch, h, b0, m1, b1, m2, b2, m3, b3);
                     }
                 },
                 _ => panic!("other.root is leaf, but other.height > 0!"),
@@ -481,15 +495,12 @@ impl Subtree {
                 Child::Branch(queue, mut branch) => {
                     match (subtrees_from_node(h, *branch), other_min, other) {
                         (Node::Binary(b0, m1, b1), m2, b2) => {
-                            return b0
-                                .join(config, m1, b1.join(config, m2, b2))
-                                .replace_queue(config, queue, true);
+                            let b1 = b1.join(config, m2, b2);
+                            return join_subtrees!(config, queue.consume(), b0, m1, b1);
                         }
                         (Node::Ternary(b0, m1, b1, m2, b2), m3, b3) => {
-                            return b0
-                                .join(config, m1, b1)
-                                .join(config, m2, b2.join(config, m3, b3))
-                                .replace_queue(config, queue, true);
+                            let b2 = b2.join(config, m3, b3);
+                            return join_subtrees!(config, queue.consume(), b0, m1, b1, m2, b2);
                         }
                     }
                 }
@@ -502,15 +513,12 @@ impl Subtree {
                 Child::Branch(queue, mut branch) => {
                     match (self, other_min, subtrees_from_node(h, *branch)) {
                         (b0, m1, Node::Binary(b1, m2, b2)) => {
-                            return (b0.join(config, m1, b1))
-                                .join(config, m2, b2)
-                                .replace_queue(config, queue);
+                            let b1 = b0.join(config, m1, b1);
+                            return join_subtrees!(config, queue.consume(), b1, m2, b2);
                         }
                         (b0, m1, Node::Ternary(b1, m2, b2, m3, b3)) => {
-                            return (b0.join(config, m1, b1))
-                                .join(config, m2, b2)
-                                .join(config, m3, b3)
-                                .replace_queue(config, queue);
+                            let b1 = b0.join(config, m1, b1);
+                            return join_subtrees!(config, queue.consume(), b1, m2, b2, m3, b3);
                         }
                     }
                 }
@@ -527,7 +535,8 @@ impl Subtree {
 
 #[derive(Debug)]
 pub struct Tree {
-    config: TreeConfig,
+    pub config: TreeConfig,
+    buffer: Queue,
     trunk: Subtree,
 }
 
@@ -536,6 +545,7 @@ impl Tree {
         Self {
             config,
             trunk: Subtree::new(),
+            buffer: Queue::default(),
         }
     }
 
@@ -548,19 +558,31 @@ impl Tree {
     }
 
     pub fn find(&self, key: K) -> Option<&K> {
-        self.trunk.find(&key)
+        match self.buffer.find(&key) {
+            Some(ref update) => update.resolve(),
+            None => self.trunk.find(&key),
+        }
     }
 
     fn to_vec(&self) -> Vec<i32> {
-        self.trunk.iter().map(|k_ref| *k_ref).collect()
+        self.buffer
+            .merge_iter(self.trunk.iter())
+            .map(|k_ref| *k_ref)
+            .collect()
     }
 
     pub fn insert(&mut self, key: K) {
-        self.update(vec![Update::Put(key)]);
+        self.update_one(Update::Put(key));
     }
 
     pub fn remove(&mut self, key: K) {
-        self.update(vec![Update::Delete(key)]);
+        self.update_one(Update::Delete(key));
+    }
+
+    pub fn update_one(&mut self, v: Update) {
+        if let Some(batch) = self.buffer.push(&self.config, v) {
+            self.update(batch);
+        }
     }
 
     pub fn update(&mut self, batch: Batch) {
@@ -624,8 +646,8 @@ mod tests {
 
         for k in 0..max_k {
             assert!(t.find(k) == Some(&k));
-            //println!("tree={:#?}, k={}", t, k);
             t.remove(k);
+            t.check_invariants();
             assert!(t.find(k) == None, "k={}, tree={:#?}", k, t);
         }
 
@@ -633,7 +655,7 @@ mod tests {
             assert!(t.find(k) == None);
         }
 
-        assert_eq!(t.height(), 1);
+        assert_eq!(t.height(), 0);
     }
 
     #[test]
@@ -645,6 +667,10 @@ mod tests {
         for n in 0..100000 {
             let mut x: Vec<Update> = (0..1024).map(Update::Put).collect();
             let mut y: Vec<Update> = Vec::new();
+
+            if n % 100 == 0 {
+                eprintln!("{}", n);
+            }
 
             while !x.is_empty() {
                 let i = Uniform::from(0..x.len()).sample(&mut rng);
@@ -695,7 +721,7 @@ mod tests {
                         }
                     }
                 }
-                t.update(batch.clone());
+                t.update(Batch::new(&t.config, SortedUpdates::new(batch.clone())).unwrap());
                 max_height = std::cmp::max(max_height, t.height());
                 assert_eq!(
                     t.to_vec(),
