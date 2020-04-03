@@ -1,4 +1,4 @@
-use crate::Child;
+use crate::subtree::Subtree;
 use crate::K;
 
 #[derive(Debug)]
@@ -18,7 +18,7 @@ impl<B, P: Copy> Node<B, P> {
     }
 }
 
-impl Node<Child, K> {
+impl Node<Subtree, K> {
     pub fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = &'a K> + 'a> {
         match self {
             Node::Binary(b0, m1, b1) => Box::new(b0.iter().chain(b1.iter())),

@@ -5,9 +5,9 @@ use crate::batch::Batch;
 use crate::node::Node;
 use crate::partition::partition;
 use crate::sorted_updates::SortedUpdates;
+use crate::subtree::Subtree;
 use crate::update::Update;
-use crate::Child;
-use crate::{Subtree, TreeConfig, K};
+use crate::{TreeConfig, K};
 
 use itertools::Itertools;
 
@@ -36,8 +36,8 @@ impl Queue {
     pub fn with_no_flush(
         config: &TreeConfig,
         updates: SortedUpdates,
-        branch: Box<Node<Child, K>>,
-    ) -> Child {
+        branch: Box<Node<Subtree, K>>,
+    ) -> Subtree {
         use Node::{Binary, Ternary};
 
         match partition(&updates, &*branch) {
@@ -51,7 +51,7 @@ impl Queue {
             }
         }
 
-        Child::Branch(Self(updates), branch)
+        Subtree::Branch(Self(updates), branch)
     }
 
     pub fn consume(self) -> SortedUpdates {
