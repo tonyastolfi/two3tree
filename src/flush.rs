@@ -1,59 +1,62 @@
+use std::ops::Range;
+
 use crate::batch::Batch;
 use crate::node::Node;
 use crate::TreeConfig;
 use crate::K;
 
-pub trait Flush {
-    fn flush(
-        &mut self,
-        config: &TreeConfig,
-        partition: &Node<usize, K>,
-        plan: &Node<Option<usize>, ()>,
-    ) -> Node<Option<Batch>, ()>;
+pub type FlushPlan = Node<Option<Range<usize>>>;
+
+pub trait Flush<K> {
+    fn flush(&mut self, config: &TreeConfig, plan: &FlushPlan) -> Node<Option<Batch<K>>>;
 }
 
-pub fn plan_flush<T>(config: &TreeConfig, partition: &Node<usize, T>) -> Node<Option<usize>, ()> {
-    let take_batch = |n: usize| {
-        if n < config.batch_size / 2 {
+// TODO - input and output Node<RangeBounds<usize>>
+pub fn plan_flush(config: &TreeConfig, partition: &Node<Range<usize>>) -> FlushPlan {
+    let take_batch = |r: &Range<usize>| -> Option<Range<usize>> {
+        if r.len() < config.batch_size / 2 {
             None
-        } else if n > config.batch_size {
-            Some(config.batch_size)
+        } else if r.len() > config.batch_size {
+            Some(Range {
+                start: r.start,
+                end: r.start + config.batch_size,
+            })
         } else {
-            Some(n)
+            Some(r.clone())
         }
     };
 
     match partition {
-        Node::Binary(n0, _, n1) => {
-            assert!(n0 + n1 <= 2 * config.batch_size);
+        Node::Binary(r0, r1) => {
+            assert!(r0.len() + r1.len() <= 2 * config.batch_size);
 
-            if n0 + n1 <= config.batch_size {
-                Node::Binary(None, (), None)
+            if r0.len() + r1.len() <= config.batch_size {
+                Node::Binary(None, None)
             } else {
-                if n0 >= n1 {
-                    Node::Binary(take_batch(*n0), (), None)
+                if r0.len() >= r1.len() {
+                    Node::Binary(take_batch(r0), None)
                 } else {
-                    Node::Binary(None, (), take_batch(*n1))
+                    Node::Binary(None, take_batch(r1))
                 }
             }
         }
-        Node::Ternary(n0, _, n1, _, n2) => {
-            let total = n0 + n1 + n2;
+        Node::Ternary(r0, r1, r2) => {
+            let total = r0.len() + r1.len() + r2.len();
 
             if total <= config.batch_size {
-                Node::Ternary(None, (), None, (), None)
+                Node::Ternary(None, None, None)
             } else {
-                match (take_batch(*n0), take_batch(*n1), take_batch(*n2)) {
+                match (take_batch(r0), take_batch(r1), take_batch(r2)) {
                     (Some(y0), Some(y1), Some(y2)) => {
-                        if y0 <= y1 && y0 <= y2 {
-                            Node::Ternary(None, (), Some(y1), (), Some(y2))
-                        } else if y1 <= y0 && y1 <= y2 {
-                            Node::Ternary(Some(y0), (), None, (), Some(y2))
+                        if y0.len() <= y1.len() && y0.len() <= y2.len() {
+                            Node::Ternary(None, Some(y1), Some(y2))
+                        } else if y1.len() <= y0.len() && y1.len() <= y2.len() {
+                            Node::Ternary(Some(y0), None, Some(y2))
                         } else {
-                            Node::Ternary(Some(y0), (), Some(y1), (), None)
+                            Node::Ternary(Some(y0), Some(y1), None)
                         }
                     }
-                    (b0, b1, b2) => Node::Ternary(b0, (), b1, (), b2),
+                    (b0, b1, b2) => Node::Ternary(b0, b1, b2),
                 }
             }
         }

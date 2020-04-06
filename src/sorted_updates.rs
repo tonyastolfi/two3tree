@@ -1,3 +1,6 @@
+use std::ops::Range;
+use std::sync::Arc;
+
 use crate::batch::Batch;
 use crate::flush::Flush;
 use crate::node::Node;
@@ -9,16 +12,16 @@ use itertools::Itertools;
 use std::ops::{Deref, RangeBounds};
 
 #[derive(Debug, Clone)]
-pub struct SortedUpdates(Vec<Update>);
+pub struct SortedUpdates<K>(Arc<[Update<K>]>);
 
-impl SortedUpdates {
+impl<K> SortedUpdates<K> {
     pub fn default() -> Self {
-        Self(Vec::new())
+        Self(Arc::new([]))
     }
 
-    pub fn new(mut updates: Vec<Update>) -> Self {
+    pub fn new(mut updates: Vec<Update<K>>) -> Self {
         updates.sort_by_cached_key(|update| *update.key());
-        Self(updates)
+        Self(updates.into_boxed_slice().into())
     }
 
     pub fn merge(self, other: Self) -> Self {
@@ -33,24 +36,27 @@ impl SortedUpdates {
                     Right(update) => update,
                     Both(_, latest) => latest,
                 })
+                .cloned()
                 .collect(),
         )
     }
 
-    pub fn insert(&mut self, v: Update) {
+    pub fn insert(&mut self, v: Update<K>) {
         match self.0.binary_search_by_key(v.key(), |u| *u.key()) {
             Ok(pos) => {
                 self.0[pos] = v;
             }
             Err(pos) => {
-                self.0.insert(pos, v);
+                let mut tmp_vec: Vec<Update> = (*self.0).into();
+                tmp_vec.insert(pos, v);
+                self.0 = tmp_vec.into();
             }
         }
     }
 
-    pub fn split_off(&mut self, index: usize) -> Self {
-        Self(self.0.split_off(index))
-    }
+    //pub fn split_off(&mut self, index: usize) -> Self {
+    //    Self(self.0.split_off(index))
+    //}
 
     pub fn drain<'a, R>(&'a mut self, range: R) -> Self
     where
@@ -60,34 +66,33 @@ impl SortedUpdates {
     }
 }
 
-impl From<SortedUpdates> for Vec<Update> {
-    fn from(sorted: SortedUpdates) -> Self {
-        sorted.0
+impl<K> From<SortedUpdates<K>> for Vec<Update<K>> {
+    fn from(sorted: SortedUpdates<K>) -> Self {
+        (*sorted.0).into()
     }
 }
 
-impl Deref for SortedUpdates {
-    type Target = [Update];
+impl<K> Deref for SortedUpdates<K> {
+    type Target = [Update<K>];
 
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-impl Flush for SortedUpdates {
+impl<K> Flush<K> for SortedUpdates<K> {
     fn flush(
         &mut self,
         config: &TreeConfig,
-        partition: &Node<usize, K>,
-        plan: &Node<Option<usize>, ()>,
-    ) -> Node<Option<Batch>, ()> {
+        plan: &Node<Option<Range<usize>>>,
+    ) -> Node<Option<Batch<K>>> {
         use Node::*;
 
         let prepare = |updates: SortedUpdates| -> Option<Batch> {
             Some(Batch::new(config, updates).unwrap())
         };
 
-        match (partition, plan) {
+        match plan {
             // no flush
             //
             (_, Binary(None, _, None)) => Binary(None, (), None),

@@ -1,18 +1,19 @@
+use std::sync::Arc;
+
 use crate::node::Node;
-use crate::partition::partition;
 use crate::queue::Queue;
-use crate::{Height, TreeConfig, K};
+use crate::{Height, TreeConfig};
 
 #[derive(Debug)]
-pub enum Subtree {
-    Leaf(Vec<K>),
-    Branch(Queue, Box<Node<Subtree, K>>),
+pub enum Subtree<K> {
+    Leaf(Arc<[K]>),
+    Branch(Queue<K>, Arc<Node<(K, Subtree<K>)>>),
 }
 
-impl Subtree {
+impl<K> Subtree<K> {
     pub fn consume_leaf(self) -> Vec<K> {
         match self {
-            Subtree::Leaf(vals) => vals,
+            Subtree::Leaf(vals) => (*vals).into(),
             _ => panic!("not a Leaf!"),
         }
     }
@@ -77,7 +78,7 @@ impl Subtree {
                             queue.len() <= config.batch_size,
                             "queue is over-full: B={}, partition={:?}, queue={:?}, old={:?}",
                             config.batch_size,
-                            partition(queue, &node),
+                            node.partition(queue),
                             queue,
                             info,
                         );
@@ -88,7 +89,7 @@ impl Subtree {
                     }
                     Node::Ternary(b0, _, b1, _, b2) => {
                         assert!(queue.len() <= config.batch_size * 3 / 2);
-                        if let Node::Ternary(n0, _, n1, _, n2) = partition(queue, node) {
+                        if let Node::Ternary(n0, _, n1, _, n2) = node.partition(queue) {
                             assert!(n0 + n1 <= config.batch_size);
                             assert!(n1 + n2 <= config.batch_size);
                         } else {

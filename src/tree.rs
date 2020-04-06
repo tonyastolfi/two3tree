@@ -1,9 +1,10 @@
+use std::sync::Arc;
+
 use itertools::Itertools;
 
 use crate::batch::Batch;
 use crate::flush::{plan_flush, Flush};
 use crate::node::Node;
-use crate::partition::partition;
 use crate::queue::Queue;
 use crate::sorted_updates::SortedUpdates;
 use crate::subtree::Subtree;
@@ -12,7 +13,7 @@ use crate::{Height, TreeConfig, K};
 #[derive(Debug)]
 pub struct Tree {
     height: Height,
-    root: Subtree,
+    root: Subtree<K>,
 }
 
 macro_rules! update_branch {
@@ -31,13 +32,10 @@ macro_rules! update_branch {
 }
 
 macro_rules! rebuild_tree {
-    ($config:expr, $height:expr, $updates:expr, $branch:expr, $subtrees:expr) => {
+    ($config:expr, $height:expr, $updates:expr, $subtrees:expr) => {
         Tree {
             height: $height,
-            root: Queue::with_no_flush($config, $updates, {
-                *$branch = node_from_trees($subtrees);
-                $branch
-            }),
+            root: Queue::with_no_flush($config, $updates, Arc::new(node_from_trees($subtrees))),
         }
     };
 }
@@ -55,10 +53,10 @@ macro_rules! make_tree {
             height: $h + 1,
             root: Subtree::Branch(
                 Queue::default(),
-                Box::new(Node::Binary(
+                Arc::new(Node::Binary(
                     update_branch!(q01, $branch, $b0, $m1, $b1),
                     $m2,
-                    Subtree::Branch(q23, Box::new(Node::Binary($b2, $m3, $b3))),
+                    Subtree::Branch(q23, Arc::new(Node::Binary($b2, $m3, $b3))),
                 )),
             ),
         }
@@ -77,7 +75,7 @@ macro_rules! join_subtrees {
     }};
 }
 
-fn trees_from_node(height: Height, node: Node<Subtree, K>) -> Node<Tree, K> {
+fn trees_from_node(height: Height, node: Node<(K, Subtree<K>)>) -> Node<(K, Tree)> {
     match node {
         Node::Binary(b0, m1, b1) => Node::Binary(
             Tree {
@@ -109,7 +107,7 @@ fn trees_from_node(height: Height, node: Node<Subtree, K>) -> Node<Tree, K> {
     }
 }
 
-fn node_from_trees(subtrees: Node<Tree, K>) -> Node<Subtree, K> {
+fn node_from_trees(subtrees: Node<(K, Tree)>) -> Node<(K, Subtree<K>)> {
     match subtrees {
         Node::Binary(t0, m1, t1) => {
             assert_eq!(t0.height, t1.height);
@@ -127,7 +125,7 @@ impl Tree {
     pub fn new() -> Self {
         Self {
             height: 0,
-            root: Subtree::Leaf(vec![]),
+            root: Subtree::Leaf(Arc::new([])),
         }
     }
 
@@ -135,7 +133,7 @@ impl Tree {
         if vals.len() <= config.batch_size * 2 {
             return Self {
                 height: if vals.len() < config.batch_size { 0 } else { 1 },
-                root: Subtree::Leaf(vals),
+                root: Subtree::Leaf(vals.into()),
             };
         }
         let split_vals: Vec<i32> = vals.split_off(vals.len() / 2);
@@ -144,10 +142,10 @@ impl Tree {
             height: 2,
             root: Subtree::Branch(
                 Queue::default(),
-                Box::new(Node::Binary(
-                    Subtree::Leaf(vals),
+                Arc::new(Node::Binary(
+                    Subtree::Leaf(vals.into()),
                     split_min,
-                    Subtree::Leaf(split_vals),
+                    Subtree::Leaf(split_vals.into()),
                 )),
             ),
         };
@@ -175,11 +173,11 @@ impl Tree {
         self.root.find(key)
     }
 
-    pub fn update(self, config: &TreeConfig, batch: Batch) -> Self {
+    pub fn update(self, config: &TreeConfig, batch: Batch<K>) -> Self {
         self.enqueue_or_flush(config, batch.consume(), true)
     }
 
-    fn update_opt(self, config: &TreeConfig, opt_batch: Option<Batch>) -> Self {
+    fn update_opt(self, config: &TreeConfig, opt_batch: Option<Batch<K>>) -> Self {
         match opt_batch {
             Some(batch) => self.update(config, batch),
             None => self,
@@ -189,12 +187,12 @@ impl Tree {
     fn enqueue_or_flush(
         self,
         config: &TreeConfig,
-        updates: SortedUpdates,
+        updates: SortedUpdates<K>,
         allow_flush: bool,
     ) -> Self {
         assert!(updates.len() <= config.batch_size * 3 / 2);
 
-        match self.root {
+        match &self.root {
             Subtree::Leaf(vals) => {
                 use itertools::EitherOrBoth::{Both, Left, Right};
 
@@ -210,17 +208,17 @@ impl Tree {
 
                 Tree::from_vals(config, merged)
             }
-            Subtree::Branch(queue, mut branch) => {
+            Subtree::Branch(queue, branch) => {
                 use Node::{Binary, Ternary};
 
                 if queue.is_empty() && updates.len() <= config.batch_size {
                     Self {
                         height: self.height,
-                        root: Subtree::Branch(Queue::new(config, updates), branch),
+                        root: Subtree::Branch(Queue::new(config, updates), branch.clone()),
                     }
                 } else {
                     let mut merged_updates = queue.consume().merge(updates);
-                    let partition = partition(&merged_updates, &*branch);
+                    let partition = branch.partition(&merged_updates);
                     let plan = if !allow_flush {
                         match &partition {
                             Node::Binary(ref n0, _, ref n1) => {
@@ -249,19 +247,19 @@ impl Tree {
                         plan_flush(config, &partition)
                     };
 
-                    match (
-                        trees_from_node(self.height, *branch),
-                        merged_updates.flush(config, &partition, &plan),
-                    ) {
-                        // No-flush cases.
-                        //
-                        (subtrees, Binary(None, _, None)) => {
-                            rebuild_tree!(config, self.height, merged_updates, branch, subtrees)
-                        }
-                        (subtrees, Ternary(None, _, None, _, None)) => {
-                            rebuild_tree!(config, self.height, merged_updates, branch, subtrees)
-                        }
+                    let flush_plan = merged_updates.flush(config, &partition, &plan);
 
+                    match &flush_plan {
+                        Binary(None, _, None) | Ternary(None, _, None, _, None) => {
+                            return Tree {
+                                height: self.height,
+                                root: Subtree::Branch(queue, branch),
+                            };
+                        }
+                        _ => (),
+                    }
+
+                    match (trees_from_node(self.height, *branch), flush_plan) {
                         // Illegal cases.
                         //
                         (_subtrees, Binary(Some(_), _, Some(_)))
@@ -319,7 +317,7 @@ impl Tree {
                     height: h + 1,
                     root: Subtree::Branch(
                         Queue::default(), // TODO maybe allow this to pull from the calling context?
-                        Box::new(Node::Binary(self.root, other_min, other.root)),
+                        Arc::new(Node::Binary(self.root, other_min, other.root)),
                     ),
                 };
             }

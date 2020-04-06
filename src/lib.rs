@@ -7,22 +7,15 @@
 use itertools::Itertools;
 
 pub mod algo;
-pub mod batch;
-pub mod flush;
+//pub mod batch;
+//pub mod flush;
 pub mod node;
-pub mod partition;
-pub mod queue;
-pub mod sorted_updates;
-pub mod subtree;
+//pub mod queue;
+//pub mod sorted_updates;
+//pub mod subtree;
 #[macro_use]
-pub mod tree;
+//pub mod tree;
 pub mod update;
-
-use batch::Batch;
-use queue::Queue;
-use sorted_updates::SortedUpdates;
-use tree::Tree;
-use update::Update;
 
 #[derive(Debug)]
 pub struct TreeConfig {
@@ -30,12 +23,21 @@ pub struct TreeConfig {
 }
 
 pub type K = i32;
+
+/*
+use batch::Batch;
+use queue::Queue;
+use sorted_updates::SortedUpdates;
+use tree::Tree;
+use update::Update;
+
+
 pub type Height = u16;
 
 #[derive(Debug)]
 pub struct TreeMut {
     pub config: TreeConfig,
-    buffer: Queue,
+    buffer: Queue<K>,
     trunk: Tree,
 }
 
@@ -78,13 +80,13 @@ impl TreeMut {
         self.update_one(Update::Delete(key));
     }
 
-    pub fn update_one(&mut self, v: Update) {
+    pub fn update_one(&mut self, v: Update<K>) {
         if let Some(batch) = self.buffer.push(&self.config, v) {
             self.update(batch);
         }
     }
 
-    pub fn update(&mut self, batch: Batch) {
+    pub fn update(&mut self, batch: Batch<K>) {
         let tmp = std::mem::replace(&mut self.trunk, Tree::new());
         self.trunk = tmp.update(&self.config, batch);
     }
@@ -165,9 +167,11 @@ mod tests {
         use rand::prelude::*;
 
         let mut rng = rand::thread_rng();
-        for n in 0..100000 {
-            let mut x: Vec<Update> = (0..1024).map(Update::Put).collect();
-            let mut y: Vec<Update> = Vec::new();
+        for n in 0..100
+        /*000*/
+        {
+            let mut x: Vec<Update<K>> = (0..1024).map(Update::Put).collect();
+            let mut y: Vec<Update<K>> = Vec::new();
 
             if n % 100 == 0 {
                 eprintln!("{}", n);
@@ -175,7 +179,7 @@ mod tests {
 
             while !x.is_empty() {
                 let i = Uniform::from(0..x.len()).sample(&mut rng);
-                let c: Update = x[i];
+                let c: Update<K> = x[i];
                 match c {
                     Update::Put(k) => {
                         x[i] = Update::Delete(k);
@@ -189,12 +193,12 @@ mod tests {
 
             let mut t = TreeMut::new(TreeConfig { batch_size: 8 });
 
-            let batches: Vec<Vec<Update>> = y
+            let batches: Vec<Vec<Update<K>>> = y
                 .chunks(t.config.batch_size)
                 .map(|chunk| {
-                    let mut tmp: Vec<Update> = Vec::from(chunk);
+                    let mut tmp: Vec<Update<K>> = Vec::from(chunk);
                     tmp.sort_by_key(|update| *update.key());
-                    let mut batch: Vec<Update> = Vec::new();
+                    let mut batch: Vec<Update<K>> = Vec::new();
                     for i in 0..(tmp.len() - 1) {
                         if tmp[i].key() != tmp[i + 1].key() {
                             batch.push(tmp[i]);
@@ -237,3 +241,4 @@ mod tests {
         }
     }
 }
+*/
