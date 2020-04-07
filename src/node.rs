@@ -1,14 +1,29 @@
+use std::iter::FromIterator;
 use std::ops::{Deref, Range};
 
-use crate::algo::lower_bound_by_key;
-//use crate::subtree::Subtree;
-use crate::update::Update;
-use crate::K;
+use smallvec::SmallVec;
 
-#[derive(Debug)]
+use crate::algo::lower_bound_by_key;
+use crate::batch::Batch;
+use crate::flush::FlushPlan;
+use crate::sorted_updates::Sorted;
+use crate::subtree::Subtree;
+use crate::update::Update;
+use crate::TreeConfig;
+
+#[derive(Debug, Clone)]
 pub enum Node<T> {
     Binary(T, T),
     Ternary(T, T, T),
+}
+
+macro_rules! make_node {
+    ($b0:expr, $b1:expr) => {
+        crate::node::Node::Binary($b0.clone(), $b1.clone())
+    };
+    ($b0:expr, $b1:expr, $b2:expr) => {
+        crate::node::Node::Ternary($b0.clone(), $b1.clone(), $b2.clone())
+    };
 }
 
 impl<K, S> Node<(K, S)> {
@@ -24,10 +39,10 @@ impl<K, S> Node<(K, S)> {
         }
     }
 
-    pub fn partition<T>(&self, items: &T) -> Node<Range<usize>>
+    pub fn partition<Q>(&self, items: &Q) -> Node<Range<usize>>
     where
         K: Ord,
-        T: Deref<Target = [Update<K>]>,
+        Q: Sorted<Item = Update<K>>,
     {
         use Node::*;
 
@@ -42,6 +57,40 @@ impl<K, S> Node<(K, S)> {
                 Ternary(0..i, i..j, j..items.len())
             }
         }
+    }
+
+    pub fn flush<'a, Q, R>(
+        &self,
+        config: &TreeConfig,
+        items: &'a Q,
+    ) -> (Node<Option<Batch<'a, Q>>>, R)
+    where
+        K: Ord + Clone,
+        Q: Sorted<Item = Update<K>>,
+        R: FromIterator<Update<K>>,
+    {
+        use Node::*;
+
+        let plan = self.partition(items).plan_flush(config);
+
+        if plan.all(|br| br.flush.is_none()) {
+            return (plan.as_ref().map(|_| None), items.iter().cloned().collect());
+        }
+
+        let to_flush: Node<Option<Batch<'a, &[Update<K>]>>> = plan
+            .as_ref()
+            .map(|br| br.flush.clone().map(|r| Batch::new(config, &&items[r])));
+
+        (
+            to_flush,
+            plan.as_ref() // => Node<&FlushPlan>
+                .as_seq() // => SmallVec<&FlushPlan>
+                .into_iter() // => Iterator<Item = &FlushPlan>
+                .filter_map(|br| br.keep.clone()) // => Iterator<Item = Range<usize>>
+                .flat_map(|r| &items[r]) // => Iterator<Item = &Update<K>>
+                .cloned() // => Iterator<Item = Update<K>>
+                .collect(),
+        )
     }
 }
 
@@ -66,10 +115,86 @@ impl<T> Node<T> {
             Ternary(a, b, c) => Ternary(f(a), f(b), f(c)),
         }
     }
+
+    pub fn all<F>(&self, f: F) -> bool
+    where
+        F: Fn(&T) -> bool,
+    {
+        use Node::*;
+
+        match self {
+            Binary(a, b) => f(a) && f(b),
+            Ternary(a, b, c) => f(a) && f(b) && f(c),
+        }
+    }
+
+    pub fn as_seq(self) -> impl IntoIterator<Item = T> {
+        use Node::*;
+
+        let sv: SmallVec<[T; 3]> = match self {
+            Binary(a, b) => smallvec!(a, b),
+            Ternary(a, b, c) => smallvec!(a, b, c),
+        };
+        sv
+    }
 }
 
-/*
-impl Node<(K, Subtree<K>)> {
+impl Node<Range<usize>> {
+    pub fn plan_flush(&self, config: &TreeConfig) -> Node<FlushPlan> {
+        use Node::*;
+
+        match self {
+            Binary(a, b) => {
+                assert!(a.len() + b.len() <= 2 * config.batch_size);
+
+                if a.len() + b.len() <= config.batch_size {
+                    Binary(FlushPlan::none(a), FlushPlan::none(b))
+                } else {
+                    if a.len() >= b.len() {
+                        Binary(FlushPlan::clip(config, a), FlushPlan::none(b))
+                    } else {
+                        Binary(FlushPlan::none(a), FlushPlan::clip(config, b))
+                    }
+                }
+            }
+            Ternary(a, b, c) => {
+                let total = a.len() + b.len() + c.len();
+
+                if total <= config.batch_size {
+                    Ternary(FlushPlan::none(a), FlushPlan::none(b), FlushPlan::none(c))
+                } else {
+                    if a.len() <= b.len() && a.len() <= c.len() {
+                        // min == a
+                        Ternary(
+                            FlushPlan::none(a),
+                            FlushPlan::clip(config, b),
+                            FlushPlan::clip(config, c),
+                        )
+                    } else if b.len() <= a.len() && b.len() <= c.len() {
+                        // min == b
+                        Ternary(
+                            FlushPlan::clip(config, a),
+                            FlushPlan::none(b),
+                            FlushPlan::clip(config, c),
+                        )
+                    } else {
+                        // min == c
+                        Ternary(
+                            FlushPlan::clip(config, a),
+                            FlushPlan::clip(config, b),
+                            FlushPlan::none(c),
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<K> Node<(K, Subtree<K>)>
+where
+    K: Ord,
+{
     pub fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = &'a K> + 'a> {
         match self {
             Node::Binary((_, b0), (_, b1)) => Box::new(b0.iter().chain(b1.iter())),
@@ -79,4 +204,3 @@ impl Node<(K, Subtree<K>)> {
         }
     }
 }
-*/

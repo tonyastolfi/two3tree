@@ -1,22 +1,23 @@
-use crate::sorted_updates::SortedUpdates;
+use crate::sorted_updates::Sorted;
+use crate::update::Update;
 use crate::TreeConfig;
 
 #[derive(Debug, Clone)]
-pub struct Batch<K>(SortedUpdates<K>);
+pub struct Batch<'a, U>(&'a U);
 
 #[derive(Debug, Clone, Copy)]
 pub struct BatchSize<'a>(&'a TreeConfig, usize);
 
-impl<K> Batch<K> {
-    pub fn new(config: &TreeConfig, updates: SortedUpdates<K>) -> Result<Self, SortedUpdates<K>> {
-        if config.batch_size / 2 <= updates.len() && updates.len() <= config.batch_size {
-            Ok(Self(updates))
-        } else {
-            Err(updates)
-        }
+impl<'a, U> Batch<'a, U>
+where
+    U: Sorted,
+{
+    pub fn new(config: &TreeConfig, updates: &'a U) -> Self {
+        assert!(config.batch_size / 2 <= updates.len() && updates.len() <= config.batch_size);
+        Self(updates)
     }
 
-    pub fn consume(self) -> SortedUpdates<K> {
+    pub fn consume(self) -> &'a U {
         self.0
     }
 }

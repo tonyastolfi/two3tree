@@ -4,14 +4,14 @@ use std::sync::Arc;
 use crate::algo::*;
 use crate::batch::Batch;
 use crate::node::Node;
-use crate::sorted_updates::SortedUpdates;
+use crate::sorted_updates::{Itemized, Sorted, SortedUpdates};
 use crate::subtree::Subtree;
 use crate::update::Update;
 use crate::{TreeConfig, K};
 
 use itertools::Itertools;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Queue<K>(SortedUpdates<K>);
 
 impl<K> Deref for Queue<K> {
@@ -22,15 +22,30 @@ impl<K> Deref for Queue<K> {
     }
 }
 
+impl<K> Into<SortedUpdates<K>> for Queue<K> {
+    fn into(self) -> SortedUpdates<K> {
+        self.0
+    }
+}
+
+impl<K> Itemized for Queue<K> {
+    type Item = Update<K>;
+}
+
+impl<K> Sorted for Queue<K> {}
+
 impl<K> Queue<K> {
     pub fn default() -> Self {
         Self(SortedUpdates::default())
     }
 
-    pub fn new(config: &TreeConfig, updates: SortedUpdates<K>) -> Self {
+    pub fn new<U>(config: &TreeConfig, updates: U) -> Self
+    where
+        U: Sorted<Item = Update<K>> + Into<SortedUpdates<K>>,
+    {
         // When created, a Queue can be at most `B` elements large.
         assert!(updates.len() <= config.batch_size);
-        Self(updates)
+        Self(updates.into())
     }
 
     pub fn with_no_flush(
@@ -91,29 +106,24 @@ impl<K> Queue<K> {
             })
     }
 
-    pub fn find<'a>(&'a self, key: &K) -> Option<&'a Update<K>> {
+    pub fn find<'a>(&'a self, key: &K) -> Option<&'a Update<K>>
+    where
+        K: Ord + Copy,
+    {
         match self.0.binary_search_by_key(key, |msg| *msg.key()) {
             Result::Ok(index) => Some(&self.0[index]),
             Result::Err(_) => None,
         }
     }
 
-    pub fn push(&mut self, config: &TreeConfig, v: Update<K>) -> Option<Batch<K>> {
-        self.0.insert(v);
-        if self.0.len() > config.batch_size {
-            let flushed = self.0.split_off(self.0.len() - config.batch_size);
-            Some(Batch::new(config, flushed).unwrap())
-        } else {
-            None
-        }
-    }
-
-    pub fn split_at_key(self, config: &TreeConfig, key: &K) -> (Self, Self) {
+    pub fn split_at_key(self, config: &TreeConfig, key: &K) -> (Self, Self)
+    where
+        K: Ord + Clone + Copy,
+    {
         let mut updates = self.consume();
         let index = lower_bound_by_key(&updates, key, |update| *update.key());
-        let q_right = Queue::new(config, updates.split_off(index));
-        let q_left = Queue::new(config, updates);
+        let (left, right) = updates.split_at(index);
 
-        (q_left, q_right)
+        (Self::new(config, left), Self::new(config, right))
     }
 }

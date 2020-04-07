@@ -4,16 +4,25 @@ use crate::node::Node;
 use crate::queue::Queue;
 use crate::{Height, TreeConfig};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Subtree<K> {
     Leaf(Arc<[K]>),
     Branch(Queue<K>, Arc<Node<(K, Subtree<K>)>>),
 }
 
+macro_rules! make_subtree {
+    ($queue:expr, $( $b:expr ),*) => {
+        crate::subtree::Subtree::Branch($queue, Arc::new(make_node!($( $b ),*)))
+    };
+}
+
 impl<K> Subtree<K> {
-    pub fn consume_leaf(self) -> Vec<K> {
+    pub fn consume_leaf(self) -> Arc<[K]>
+    where
+        K: Clone,
+    {
         match self {
-            Subtree::Leaf(vals) => (*vals).into(),
+            Subtree::Leaf(vals) => vals,
             _ => panic!("not a Leaf!"),
         }
     }
@@ -28,13 +37,13 @@ impl<K> Subtree<K> {
                 }
             }
             Subtree::Branch(_, ref branch) => match &**branch {
-                Node::Binary(b0, _, b1) => {
+                Node::Binary((_, b0), (_, b1)) => {
                     let h0 = b0.check_height(config);
                     let h1 = b1.check_height(config);
                     assert_eq!(h0, h1);
                     h0 + 1
                 }
-                Node::Ternary(b0, _, b1, _, b2) => {
+                Node::Ternary((_, b0), (_, b1), (_, b2)) => {
                     let h0 = b0.check_height(config);
                     let h1 = b1.check_height(config);
                     let h2 = b2.check_height(config);
@@ -52,7 +61,9 @@ impl<K> Subtree<K> {
         height: Height,
         deep: bool,
         info: Option<&str>,
-    ) {
+    ) where
+        K: std::fmt::Debug + Ord,
+    {
         match self {
             Subtree::Leaf(ref vals) => {
                 assert!(
@@ -73,7 +84,7 @@ impl<K> Subtree<K> {
                 assert!(height > 1, "all non-leaf children must be at height > 1");
                 let node = &**branch;
                 match node {
-                    Node::Binary(b0, _, b1) => {
+                    Node::Binary((_, b0), (_, b1)) => {
                         assert!(
                             queue.len() <= config.batch_size,
                             "queue is over-full: B={}, partition={:?}, queue={:?}, old={:?}",
@@ -87,11 +98,11 @@ impl<K> Subtree<K> {
                             b1.check_invariants(config, height - 1, deep, None);
                         }
                     }
-                    Node::Ternary(b0, _, b1, _, b2) => {
+                    Node::Ternary((_, b0), (_, b1), (_, b2)) => {
                         assert!(queue.len() <= config.batch_size * 3 / 2);
-                        if let Node::Ternary(n0, _, n1, _, n2) = node.partition(queue) {
-                            assert!(n0 + n1 <= config.batch_size);
-                            assert!(n1 + n2 <= config.batch_size);
+                        if let Node::Ternary(n0, n1, n2) = node.partition(queue) {
+                            assert!(n0.len() + n1.len() <= config.batch_size);
+                            assert!(n1.len() + n2.len() <= config.batch_size);
                         } else {
                             panic!("Queue::partition should have returned a ternary node");
                         }
@@ -106,7 +117,10 @@ impl<K> Subtree<K> {
         }
     }
 
-    pub fn find(&self, key: &K) -> Option<&K> {
+    pub fn find(&self, key: &K) -> Option<&K>
+    where
+        K: Ord + Copy,
+    {
         match self {
             Subtree::Leaf(vals) => match vals.binary_search(key) {
                 Ok(index) => Some(&vals[index]),
@@ -115,14 +129,14 @@ impl<K> Subtree<K> {
             Subtree::Branch(ref queue, ref branch) => match queue.find(key) {
                 Some(ref update) => update.resolve(),
                 None => match &**branch {
-                    Node::Binary(b0, m1, b1) => {
+                    Node::Binary((_m0, b0), (m1, b1)) => {
                         if key < m1 {
                             b0.find(key)
                         } else {
                             b1.find(key)
                         }
                     }
-                    Node::Ternary(b0, m1, b1, m2, b2) => {
+                    Node::Ternary((_m0, b0), (m1, b1), (m2, b2)) => {
                         if key < m1 {
                             b0.find(key)
                         } else if key < m2 {
@@ -136,13 +150,16 @@ impl<K> Subtree<K> {
         }
     }
 
-    pub fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = &'a K> + 'a> {
+    pub fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = &'a K> + 'a>
+    where
+        K: Ord,
+    {
         use Subtree::{Branch, Leaf};
 
         match self {
             Leaf(vals) => Box::new(vals.iter()),
             Branch(ref queue, ref branch) => {
-                let node = &**branch;
+                let node = &*branch;
                 Box::new(queue.merge_iter(node.iter()))
             }
         }

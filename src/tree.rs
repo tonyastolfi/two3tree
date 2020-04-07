@@ -1,158 +1,132 @@
 use std::sync::Arc;
 
 use itertools::Itertools;
+use smallvec::SmallVec;
 
 use crate::batch::Batch;
-use crate::flush::{plan_flush, Flush};
 use crate::node::Node;
 use crate::queue::Queue;
-use crate::sorted_updates::SortedUpdates;
+use crate::sorted_updates::{Sorted, SortedUpdates};
 use crate::subtree::Subtree;
-use crate::{Height, TreeConfig, K};
+use crate::update::{apply_updates, Update};
+use crate::{Height, TreeConfig};
 
-#[derive(Debug)]
-pub struct Tree {
+#[derive(Debug, Clone)]
+pub struct Tree<K> {
     height: Height,
-    root: Subtree<K>,
-}
-
-macro_rules! update_branch {
-    ($queue:expr, $branch:expr, $b0:expr, $m1:expr, $b1:expr) => {
-        Subtree::Branch($queue, {
-            *$branch = Node::Binary($b0, $m1, $b1);
-            $branch
-        })
-    };
-    ($queue:expr, $branch:expr, $b0:expr, $m1:expr, $b1:expr, $m2:expr, $b2:expr) => {
-        Subtree::Branch($queue, {
-            *$branch = Node::Ternary($b0, $m1, $b1, $m2, $b2);
-            $branch
-        })
-    };
-}
-
-macro_rules! rebuild_tree {
-    ($config:expr, $height:expr, $updates:expr, $subtrees:expr) => {
-        Tree {
-            height: $height,
-            root: Queue::with_no_flush($config, $updates, Arc::new(node_from_trees($subtrees))),
-        }
-    };
+    root: (K, Subtree<K>),
 }
 
 macro_rules! make_tree {
-    ($config:expr, $queue:expr, $branch:expr, $h:expr, $b0:expr, $m1:expr, $b1:expr, $m2:expr, $b2:expr) => {{
+    ($config:expr, $queue:expr, $h:expr, $b0:expr, $b1:expr, $b2:expr) => {{
         Tree {
             height: $h,
-            root: update_branch!($queue, $branch, $b0, $m1, $b1, $m2, $b2),
+            root: ($b0.0, make_subtree!($queue, $b0, $b1, $b2)),
         }
     }};
-    ($config:expr, $queue:expr, $branch:expr, $h:expr, $b0:expr, $m1:expr, $b1:expr, $m2:expr, $b2:expr, $m3:expr, $b3:expr) => {{
-        let (q01, q23) = $queue.split_at_key($config, &$m2);
+    ($config:expr, $queue:expr, $h:expr, $b0:expr, $b1:expr, $b2:expr, $b3:expr) => {{
+        let (q_left, q_right) = $queue.split_at_key($config, &$b2.0);
         Tree {
             height: $h + 1,
-            root: Subtree::Branch(
-                Queue::default(),
-                Arc::new(Node::Binary(
-                    update_branch!(q01, $branch, $b0, $m1, $b1),
-                    $m2,
-                    Subtree::Branch(q23, Arc::new(Node::Binary($b2, $m3, $b3))),
-                )),
+            root: (
+                $b0.0,
+                make_subtree!(
+                    Queue::default(),
+                    ($b0.0, make_subtree!(q_left, $b0, $b1)),
+                    ($b2.0, make_subtree!(q_right, $b2, $b3))
+                ),
             ),
         }
     }};
 }
 
 macro_rules! join_subtrees {
-    ($config:expr, $updates:expr, $b0:expr, $m1:expr, $b1:expr) => {{
-        $b0.join($config, $m1, $b1)
-            .enqueue_or_flush($config, $updates, true)
+    ($config:expr, $updates:expr, $b0:expr, $b1:expr) => {{
+        $b0.join($config, $b1).enqueue_or_flush($config, $updates)
     }};
-    ($config:expr, $updates:expr, $b0:expr, $m1:expr, $b1:expr, $m2:expr, $b2:expr) => {{
-        $b0.join($config, $m1, $b1)
-            .join($config, $m2, $b2)
-            .enqueue_or_flush($config, $updates, true)
+    ($config:expr, $updates:expr, $b0:expr, $b1:expr, $b2:expr) => {{
+        $b0.join($config, $b1)
+            .join($config, $b2)
+            .enqueue_or_flush($config, $updates)
     }};
 }
 
-fn trees_from_node(height: Height, node: Node<(K, Subtree<K>)>) -> Node<(K, Tree)> {
-    match node {
-        Node::Binary(b0, m1, b1) => Node::Binary(
-            Tree {
-                height: height - 1,
-                root: b0,
-            },
-            m1,
-            Tree {
-                height: height - 1,
-                root: b1,
-            },
-        ),
-        Node::Ternary(b0, m1, b1, m2, b2) => Node::Ternary(
-            Tree {
-                height: height - 1,
-                root: b0,
-            },
-            m1,
-            Tree {
-                height: height - 1,
-                root: b1,
-            },
-            m2,
-            Tree {
-                height: height - 1,
-                root: b2,
-            },
-        ),
-    }
+fn trees_from_node<K>(height: Height, node: &Node<(K, Subtree<K>)>) -> Node<Tree<K>>
+where
+    K: Clone,
+{
+    node.as_ref().map(|(k, s)| Tree {
+        height: height - 1,
+        root: (k.clone(), (*s).clone()),
+    })
 }
 
-fn node_from_trees(subtrees: Node<(K, Tree)>) -> Node<(K, Subtree<K>)> {
-    match subtrees {
-        Node::Binary(t0, m1, t1) => {
+fn node_from_trees<K>(trees: Node<Tree<K>>) -> Node<(K, Subtree<K>)> {
+    match trees {
+        Node::Binary(t0, t1) => {
             assert_eq!(t0.height, t1.height);
-            Node::Binary(t0.root, m1, t1.root)
+            Node::Binary(t0.root, t1.root)
         }
-        Node::Ternary(t0, m1, t1, m2, t2) => {
+        Node::Ternary(t0, t1, t2) => {
             assert_eq!(t0.height, t1.height);
             assert_eq!(t1.height, t2.height);
-            Node::Ternary(t0.root, m1, t1.root, m2, t2.root)
+            Node::Ternary(t0.root, t1.root, t2.root)
         }
     }
 }
 
-impl Tree {
+impl<K> Tree<K>
+where
+    K: Ord + std::fmt::Debug + Copy + Default,
+{
     pub fn new() -> Self {
         Self {
             height: 0,
-            root: Subtree::Leaf(Arc::new([])),
+            root: (K::default(), Subtree::Leaf(Arc::new([]))),
         }
     }
 
-    pub fn from_vals(config: &TreeConfig, mut vals: Vec<K>) -> Self {
-        if vals.len() <= config.batch_size * 2 {
+    pub fn from_vals(config: &TreeConfig, n_vals: usize, vals: impl Iterator<Item = K>) -> Self {
+        if n_vals <= config.batch_size * 2 {
+            let vals: Arc<[K]> = vals.collect();
+            let first = *(*vals).first().unwrap_or(&K::default());
             return Self {
-                height: if vals.len() < config.batch_size { 0 } else { 1 },
-                root: Subtree::Leaf(vals.into()),
+                height: if n_vals < config.batch_size { 0 } else { 1 },
+                root: (first, Subtree::Leaf(vals)),
             };
         }
-        let split_vals: Vec<i32> = vals.split_off(vals.len() / 2);
-        let split_min: i32 = split_vals[0];
+
+        let mut split_vals: Vec<Arc<[K]>> = vals
+            .chunks((n_vals + 1) / 2)
+            .into_iter()
+            .map(|subvals| subvals.collect::<Arc<[K]>>())
+            .collect();
+
+        assert_eq!(split_vals.len(), 2);
+        assert!(split_vals[0].len() > 0);
+        assert!(split_vals[1].len() > 0);
+
+        let left_vals = split_vals.remove(0);
+        let right_vals = split_vals.remove(0);
+
+        let first_key = left_vals[0];
+        let middle_key = right_vals[0];
+
         return Self {
             height: 2,
-            root: Subtree::Branch(
-                Queue::default(),
-                Arc::new(Node::Binary(
-                    Subtree::Leaf(vals.into()),
-                    split_min,
-                    Subtree::Leaf(split_vals.into()),
-                )),
+            root: (
+                first_key,
+                make_subtree!(
+                    Queue::default(),
+                    (first_key, Subtree::Leaf(left_vals)),
+                    (middle_key, Subtree::Leaf(right_vals))
+                ),
             ),
         };
     }
 
     pub fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = &'a K> + 'a> {
-        self.root.iter()
+        self.root.1.iter()
     }
 
     pub fn height(&self) -> Height {
@@ -160,154 +134,140 @@ impl Tree {
     }
 
     pub fn check_height(&self, config: &TreeConfig) -> Height {
-        assert_eq!(self.height, self.root.check_height(config));
+        assert_eq!(self.height, self.root.1.check_height(config));
         self.height
     }
 
     pub fn check_invariants(&self, config: &TreeConfig) {
-        assert_eq!(self.height, self.root.check_height(config));
-        self.root.check_invariants(config, self.height, true, None);
+        assert_eq!(self.height, self.root.1.check_height(config));
+        self.root
+            .1
+            .check_invariants(config, self.height, true, None);
     }
 
     pub fn find(&self, key: &K) -> Option<&K> {
-        self.root.find(key)
+        self.root.1.find(key)
     }
 
-    pub fn update(self, config: &TreeConfig, batch: Batch<K>) -> Self {
-        self.enqueue_or_flush(config, batch.consume(), true)
+    pub fn update<'a, U>(self, config: &TreeConfig, batch: Batch<'a, U>) -> Self
+    where
+        U: Sorted<Item = Update<K>>,
+    {
+        let updates: SortedUpdates<K> = batch.consume();
+        self.enqueue_or_flush(config, updates)
     }
 
-    fn update_opt(self, config: &TreeConfig, opt_batch: Option<Batch<K>>) -> Self {
+    fn update_opt<'a, U>(self, config: &TreeConfig, opt_batch: Option<Batch<'a, U>>) -> Self
+    where
+        U: Sorted<Item = Update<K>>,
+    {
         match opt_batch {
             Some(batch) => self.update(config, batch),
             None => self,
         }
     }
 
-    fn enqueue_or_flush(
-        self,
-        config: &TreeConfig,
-        updates: SortedUpdates<K>,
-        allow_flush: bool,
-    ) -> Self {
+    fn enqueue_or_flush<U>(self, config: &TreeConfig, updates: U) -> Self
+    where
+        U: Sorted<Item = Update<K>> + Into<SortedUpdates<K>>,
+    {
         assert!(updates.len() <= config.batch_size * 3 / 2);
 
-        match &self.root {
-            Subtree::Leaf(vals) => {
+        match self.root {
+            (_, Subtree::Leaf(vals)) => {
                 use itertools::EitherOrBoth::{Both, Left, Right};
 
-                let mut merged: Vec<K> = vals
-                    .iter()
-                    .merge_join_by(updates.into_iter(), |old, update| old.cmp(&update.key()))
-                    .filter_map(|either| match either {
-                        Left(old) => Some(*old),
-                        Right(update) => update.resolve().map(|item_ref| *item_ref),
-                        Both(_old, update) => update.resolve().map(|item_ref| *item_ref),
-                    })
+                let merged: SmallVec<[K; 1024]> = apply_updates(vals.iter(), updates.into_iter())
+                    .cloned()
                     .collect();
 
-                Tree::from_vals(config, merged)
+                let n_merged = merged.len();
+
+                Tree::from_vals(config, n_merged, merged.into_iter())
             }
-            Subtree::Branch(queue, branch) => {
+            (min_key, Subtree::Branch(queue, branch)) => {
                 use Node::{Binary, Ternary};
 
                 if queue.is_empty() && updates.len() <= config.batch_size {
                     Self {
                         height: self.height,
-                        root: Subtree::Branch(Queue::new(config, updates), branch.clone()),
+                        root: (
+                            min_key,
+                            Subtree::Branch(Queue::new(config, updates), branch.clone()),
+                        ),
                     }
                 } else {
                     let mut merged_updates = queue.consume().merge(updates);
                     let partition = branch.partition(&merged_updates);
-                    let plan = if !allow_flush {
-                        match &partition {
-                            Node::Binary(ref n0, _, ref n1) => {
-                                assert!(n0 + n1 <= config.batch_size);
-                                Node::Binary(None, (), None)
-                            }
-                            Node::Ternary(ref n0, _, ref n1, _, ref n2) => {
-                                assert!(
-                                    n0 + n1 <= config.batch_size,
-                                    "node is not 2/3 balanced: {:?}, queue={:?}, branch={:#?}",
-                                    partition,
-                                    merged_updates,
-                                    branch
-                                );
-                                assert!(
-                                    n1 + n2 <= config.batch_size,
-                                    "node is not 2/3 balanced: {:?}, queue={:?}, branch={:#?}",
-                                    partition,
-                                    merged_updates,
-                                    branch
-                                );
-                                Node::Ternary(None, (), None, (), None)
-                            }
-                        }
-                    } else {
-                        plan_flush(config, &partition)
-                    };
 
-                    let flush_plan = merged_updates.flush(config, &partition, &plan);
+                    match (&*branch).flush(config, &mut merged_updates) {
+                        // No flush.
+                        //
+                        (Binary(None, None), unflushed)
+                        | (Ternary(None, None, None), unflushed) => Tree {
+                            height: self.height,
+                            root: (min_key, Queue::with_no_flush(config, unflushed, branch)),
+                        },
 
-                    match &flush_plan {
-                        Binary(None, _, None) | Ternary(None, _, None, _, None) => {
-                            return Tree {
-                                height: self.height,
-                                root: Subtree::Branch(queue, branch),
-                            };
-                        }
-                        _ => (),
-                    }
-
-                    match (trees_from_node(self.height, *branch), flush_plan) {
                         // Illegal cases.
                         //
-                        (_subtrees, Binary(Some(_), _, Some(_)))
-                        | (_subtrees, Ternary(Some(_), _, Some(_), _, Some(_))) => {
+                        (Binary(Some(_), Some(_)), _) | (Ternary(Some(_), Some(_), Some(_)), _) => {
                             panic!("Too many branches flushed!");
                         }
 
                         // Binary node flush.
                         //
-                        (Binary(b0, m1, b1), Binary(opt_x0, _, opt_x1)) => {
-                            let b0 = b0.update_opt(config, opt_x0);
-                            let b1 = b1.update_opt(config, opt_x1);
+                        (Binary(batch0, batch1), unflushed) => {
+                            match trees_from_node(self.height, &*branch) {
+                                Binary(child0, child1) => {
+                                    let child0 = child0.update_opt(config, batch0);
+                                    let child1 = child1.update_opt(config, batch1);
 
-                            join_subtrees!(config, merged_updates, b0, m1, b1)
+                                    join_subtrees!(config, unflushed, child0, child1)
+                                }
+                                Ternary(..) => {
+                                    panic!("illegal plan (binary flush plan for a ternary node)")
+                                }
+                            }
                         }
 
                         // Ternary node flush.
                         //
-                        (Ternary(b0, m1, b1, m2, b2), Ternary(opt_x0, _, opt_x1, _, opt_x2)) => {
-                            let b0 = b0.update_opt(config, opt_x0);
-                            let b1 = b1.update_opt(config, opt_x1);
-                            let b2 = b2.update_opt(config, opt_x2);
+                        (Ternary(batch0, batch1, batch2), unflushed) => {
+                            match trees_from_node(self.height, &*branch) {
+                                Ternary(child0, child1, child2) => {
+                                    let child0 = child0.update_opt(config, batch0);
+                                    let child1 = child1.update_opt(config, batch1);
+                                    let child2 = child2.update_opt(config, batch2);
 
-                            join_subtrees!(config, merged_updates, b0, m1, b1, m2, b2)
+                                    join_subtrees!(config, unflushed, child0, child1, child2)
+                                }
+                                Binary(..) => {
+                                    panic!("illegal plan (ternary flush plan for a binary node)")
+                                }
+                            }
                         }
-
-                        // Badness.
-                        //
-                        (subtrees, _) => panic!(
-                            "illegal plan {:?} for node {:?}",
-                            plan,
-                            node_from_trees(subtrees)
-                        ),
                     }
                 }
             }
         }
     }
 
-    pub fn join(self, config: &TreeConfig, other_min: K, other: Tree) -> Self {
+    pub fn join(self, config: &TreeConfig, other: Self) -> Self {
         match (self.height, other.height) {
             // Join the leaf values, producing either a single new leaf or two
             // leaves under a new binary node.
             //
             (h, other_h) if h <= 1 && other_h <= 1 => {
-                let mut vals = self.root.consume_leaf();
-                vals.append(&mut other.root.consume_leaf());
-                Tree::from_vals(config, vals)
+                let left_vals: Arc<[K]> = self.root.1.consume_leaf();
+                let right_vals: Arc<[K]> = other.root.1.consume_leaf();
+                let n_vals = left_vals.len() + right_vals.len();
+
+                Tree::from_vals(
+                    config,
+                    n_vals,
+                    left_vals.iter().chain(right_vals.iter()).cloned(),
+                )
             }
 
             // Grow the tree under a new binary node.
@@ -315,9 +275,12 @@ impl Tree {
             (h, other_h) if h != 1 && other_h == h => {
                 return Self {
                     height: h + 1,
-                    root: Subtree::Branch(
-                        Queue::default(), // TODO maybe allow this to pull from the calling context?
-                        Arc::new(Node::Binary(self.root, other_min, other.root)),
+                    root: (
+                        self.root.0,
+                        Subtree::Branch(
+                            Queue::default(), // TODO maybe allow this to pull from the calling context?
+                            Arc::new(Node::Binary(self.root, other.root)),
+                        ),
                     ),
                 };
             }
@@ -325,12 +288,12 @@ impl Tree {
             //  (h + 1, h) -> destructure self, merge other as right child
             //
             (h, other_h) if h == other_h + 1 => match self.root {
-                Subtree::Branch(queue, mut branch) => match (*branch, other_min, other.root) {
-                    (Node::Binary(b0, m1, b1), m2, b2) => {
-                        return make_tree!(config, queue, branch, h, b0, m1, b1, m2, b2);
+                (_, Subtree::Branch(queue, mut branch)) => match (&*branch, &other.root) {
+                    (Node::Binary(b0, b1), b2) => {
+                        return make_tree!(config, queue, h, b0, b1, b2);
                     }
-                    (Node::Ternary(b0, m1, b1, m2, b2), m3, b3) => {
-                        return make_tree!(config, queue, branch, h, b0, m1, b1, m2, b2, m3, b3);
+                    (Node::Ternary(b0, b1, b2), b3) => {
+                        return make_tree!(config, queue, h, b0, b1, b2, b3);
                     }
                 },
                 _ => panic!("self.root is leaf, but self.height > 0!"),
@@ -338,12 +301,12 @@ impl Tree {
 
             //  (h, h + 1) -> destructure other, merge self as left child
             (self_h, h) if self_h + 1 == h => match other.root {
-                Subtree::Branch(queue, mut branch) => match (self.root, other_min, *branch) {
-                    (b0, m1, Node::Binary(b1, m2, b2)) => {
-                        return make_tree!(config, queue, branch, h, b0, m1, b1, m2, b2);
+                (_, Subtree::Branch(queue, mut branch)) => match (&self.root, &*branch) {
+                    (b0, Node::Binary(b1, b2)) => {
+                        return make_tree!(config, queue, h, b0, b1, b2);
                     }
-                    (b0, m1, Node::Ternary(b1, m2, b2, m3, b3)) => {
-                        return make_tree!(config, queue, branch, h, b0, m1, b1, m2, b2, m3, b3);
+                    (b0, Node::Ternary(b1, b2, b3)) => {
+                        return make_tree!(config, queue, h, b0, b1, b2, b3);
                     }
                 },
                 _ => panic!("other.root is leaf, but other.height > 0!"),
@@ -352,15 +315,15 @@ impl Tree {
             //  (h + d, h), d > 1  -> recursive case
             //
             (h, other_h) if h > other_h + 1 => match self.root {
-                Subtree::Branch(queue, mut branch) => {
-                    match (trees_from_node(h, *branch), other_min, other) {
-                        (Node::Binary(b0, m1, b1), m2, b2) => {
-                            let b1 = b1.join(config, m2, b2);
-                            return join_subtrees!(config, queue.consume(), b0, m1, b1);
+                (_, Subtree::Branch(queue, mut branch)) => {
+                    match (trees_from_node(h, &*branch), other) {
+                        (Node::Binary(b0, b1), b2) => {
+                            let b1 = b1.join(config, b2);
+                            return join_subtrees!(config, queue.consume(), b0, b1);
                         }
-                        (Node::Ternary(b0, m1, b1, m2, b2), m3, b3) => {
-                            let b2 = b2.join(config, m3, b3);
-                            return join_subtrees!(config, queue.consume(), b0, m1, b1, m2, b2);
+                        (Node::Ternary(b0, b1, b2), b3) => {
+                            let b2 = b2.join(config, b3);
+                            return join_subtrees!(config, queue.consume(), b0, b1, b2);
                         }
                     }
                 }
@@ -370,15 +333,15 @@ impl Tree {
             //  (h, h + d), d > 1  -> recursive case
             //
             (h_self, h) if h > h_self + 1 => match other.root {
-                Subtree::Branch(queue, mut branch) => {
-                    match (self, other_min, trees_from_node(h, *branch)) {
-                        (b0, m1, Node::Binary(b1, m2, b2)) => {
-                            let b1 = b0.join(config, m1, b1);
-                            return join_subtrees!(config, queue.consume(), b1, m2, b2);
+                (_, Subtree::Branch(queue, mut branch)) => {
+                    match (self, trees_from_node(h, &*branch)) {
+                        (b0, Node::Binary(b1, b2)) => {
+                            let b1 = b0.join(config, b1);
+                            return join_subtrees!(config, queue.consume(), b1, b2);
                         }
-                        (b0, m1, Node::Ternary(b1, m2, b2, m3, b3)) => {
-                            let b1 = b0.join(config, m1, b1);
-                            return join_subtrees!(config, queue.consume(), b1, m2, b2, m3, b3);
+                        (b0, Node::Ternary(b1, b2, b3)) => {
+                            let b1 = b0.join(config, b1);
+                            return join_subtrees!(config, queue.consume(), b1, b2, b3);
                         }
                     }
                 }
