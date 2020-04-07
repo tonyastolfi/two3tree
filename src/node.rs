@@ -6,7 +6,7 @@ use smallvec::SmallVec;
 use crate::algo::lower_bound_by_key;
 use crate::batch::Batch;
 use crate::flush::FlushPlan;
-use crate::sorted_updates::Sorted;
+use crate::sorted_updates::{Sorted, SortedSlice};
 use crate::subtree::Subtree;
 use crate::update::Update;
 use crate::TreeConfig;
@@ -63,7 +63,7 @@ impl<K, S> Node<(K, S)> {
         &self,
         config: &TreeConfig,
         items: &'a Q,
-    ) -> (Node<Option<Batch<'a, Q>>>, R)
+    ) -> (Node<Option<Batch<SortedSlice<'a, Update<K>>>>>, R)
     where
         K: Ord + Clone,
         Q: Sorted<Item = Update<K>>,
@@ -77,9 +77,11 @@ impl<K, S> Node<(K, S)> {
             return (plan.as_ref().map(|_| None), items.iter().cloned().collect());
         }
 
-        let to_flush: Node<Option<Batch<'a, &[Update<K>]>>> = plan
-            .as_ref()
-            .map(|br| br.flush.clone().map(|r| Batch::new(config, &&items[r])));
+        let to_flush: Node<Option<Batch<SortedSlice<'a, Update<K>>>>> = plan.as_ref().map(|br| {
+            br.flush
+                .clone()
+                .map(|r| Batch::new(config, items.sorted_slice(r)))
+        });
 
         (
             to_flush,

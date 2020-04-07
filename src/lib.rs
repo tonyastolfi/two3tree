@@ -90,13 +90,13 @@ impl TreeMut {
         if self.wal.len() >= self.config.batch_size {
             let batch_items: Vec<Update<K>> =
                 self.wal.split_off(self.wal.len() - self.config.batch_size);
-            self.update(Batch::new(&self.config, &SortedUpdates::new(batch_items)));
+            self.update(Batch::new(&self.config, SortedUpdates::new(batch_items)));
         }
     }
 
-    pub fn update<'a, U>(&mut self, batch: Batch<'a, U>)
+    pub fn update<'a, U>(&mut self, batch: Batch<U>)
     where
-        U: Sorted<Item = Update<K>>,
+        U: Sorted<Item = Update<K>> + Into<SortedUpdates<K>>,
     {
         let tmp = std::mem::replace(&mut self.trunk, Tree::new());
         self.trunk = tmp.update(&self.config, batch);

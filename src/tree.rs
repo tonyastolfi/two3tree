@@ -6,7 +6,7 @@ use smallvec::SmallVec;
 use crate::batch::Batch;
 use crate::node::Node;
 use crate::queue::Queue;
-use crate::sorted_updates::{Sorted, SortedUpdates};
+use crate::sorted_updates::{MergedUpdates, Sorted, SortedUpdates};
 use crate::subtree::Subtree;
 use crate::update::{apply_updates, Update};
 use crate::{Height, TreeConfig};
@@ -149,17 +149,17 @@ where
         self.root.1.find(key)
     }
 
-    pub fn update<'a, U>(self, config: &TreeConfig, batch: Batch<'a, U>) -> Self
+    pub fn update<'a, U>(self, config: &TreeConfig, batch: Batch<U>) -> Self
     where
-        U: Sorted<Item = Update<K>>,
+        U: Sorted<Item = Update<K>> + Into<SortedUpdates<K>>,
     {
-        let updates: SortedUpdates<K> = batch.consume();
+        let updates: U = batch.consume();
         self.enqueue_or_flush(config, updates)
     }
 
-    fn update_opt<'a, U>(self, config: &TreeConfig, opt_batch: Option<Batch<'a, U>>) -> Self
+    fn update_opt<'a, U>(self, config: &TreeConfig, opt_batch: Option<Batch<U>>) -> Self
     where
-        U: Sorted<Item = Update<K>>,
+        U: Sorted<Item = Update<K>> + Into<SortedUpdates<K>>,
     {
         match opt_batch {
             Some(batch) => self.update(config, batch),
@@ -197,10 +197,10 @@ where
                         ),
                     }
                 } else {
-                    let mut merged_updates = queue.consume().merge(updates);
+                    let mut merged_updates: MergedUpdates<K> = queue.consume().merge(updates);
                     let partition = branch.partition(&merged_updates);
 
-                    match (&*branch).flush(config, &mut merged_updates) {
+                    match (&*branch).flush(config, &merged_updates) {
                         // No flush.
                         //
                         (Binary(None, None), unflushed)

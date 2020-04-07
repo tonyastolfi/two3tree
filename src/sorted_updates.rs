@@ -47,7 +47,7 @@ impl<K> SortedUpdates<K> {
     pub fn merge<Other>(&self, other: Other) -> MergedUpdates<K>
     where
         K: Ord + Clone,
-        Other: Sorted,
+        Other: Sorted<Item = Update<K>>,
     {
         use itertools::EitherOrBoth::{Both, Left, Right};
 
@@ -90,6 +90,15 @@ where
     K: Clone,
 {
     fn from(other: MergedUpdates<K>) -> Self {
+        Self(other.into_iter().cloned().collect())
+    }
+}
+
+impl<'a, K> From<SortedSlice<'a, Update<K>>> for SortedUpdates<K>
+where
+    K: Clone,
+{
+    fn from(other: SortedSlice<'a, Update<K>>) -> Self {
         Self(other.into_iter().cloned().collect())
     }
 }
@@ -137,3 +146,15 @@ impl<K> Itemized for MergedUpdates<K> {
     type Item = Update<K>;
 }
 impl<K> Sorted for MergedUpdates<K> {}
+
+impl<'a, T> Deref for SortedSlice<'a, T> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+    }
+}
+impl<'a, T> Itemized for SortedSlice<'a, T> {
+    type Item = T;
+}
+impl<'a, T> Sorted for SortedSlice<'a, T> {}
