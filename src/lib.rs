@@ -15,6 +15,7 @@ pub mod batch;
 pub mod flush;
 #[macro_use]
 pub mod node;
+pub mod node_arena;
 pub mod queue;
 pub mod sorted_updates;
 #[macro_use]
