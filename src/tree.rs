@@ -109,17 +109,17 @@ where
         let left_vals = split_vals.remove(0);
         let right_vals = split_vals.remove(0);
 
-        let first_key = left_vals[0];
-        let middle_key = right_vals[0];
+        let left_min = left_vals[0];
+        let right_min = right_vals[0];
 
         return Self {
             height: 2,
             root: (
-                first_key,
+                left_min,
                 make_subtree!(
                     Queue::default(),
-                    (first_key, Subtree::Leaf(left_vals)),
-                    (middle_key, Subtree::Leaf(right_vals))
+                    (left_min, Subtree::Leaf(left_vals)),
+                    (right_min, Subtree::Leaf(right_vals))
                 ),
             ),
         };
